@@ -2,7 +2,7 @@
 
 **一个简单的积分商店插件**
 
-([https://www.google.com/search?q=https://github.com/Pryaxis/TShock](https://github.com/CandyourGoose/EpointPlugin)
+([https://github.com/CandyourGoose/EpointPlugin](https://github.com/CandyourGoose/EpointPlugin]))
 
 
 
