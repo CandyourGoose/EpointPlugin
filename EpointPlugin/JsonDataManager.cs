@@ -12,7 +12,7 @@ namespace EpointPlugin
     {
         [JsonProperty("玩家名")] public string PlayerName { get; set; } = "";
         [JsonProperty("积分余额")] public int Points { get; set; }
-        [JsonProperty("今日已获取积分")] public int PointsToday { get; set; } // 用于每天计算上限时使用
+        [JsonProperty("当日已获取积分")] public int PointsToday { get; set; }
         [JsonProperty("累计登录天数")] public int TotalDays { get; set; }
         [JsonProperty("连续签到天数")] public int StreakDays { get; set; }
         [JsonProperty("上次登录日期")] public string LastLoginDate { get; set; } = ""; // 格式：yyyy-MM-dd
