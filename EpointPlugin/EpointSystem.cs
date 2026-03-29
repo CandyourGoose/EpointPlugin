@@ -1,12 +1,15 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Linq;
 using System.Threading.Tasks;
+using System.IO;
 using System.Timers;
 using Terraria;
 using TerrariaApi.Server;
 using TShockAPI;
 using TShockAPI.Hooks;
+using Newtonsoft.Json;
 
 namespace EpointPlugin
 {
@@ -17,12 +20,36 @@ namespace EpointPlugin
     {
         private static readonly Random Rand = new Random(); // 随机数生成器（用于运气波动计算）
         private static System.Timers.Timer? _onlineTimer;   // 负责定时发放在线奖励的时钟
-        private static System.Timers.Timer? _autoSignInTimer;
+        private static System.Timers.Timer? _autoSignInTimer; // 负责自动发放签到奖励的时钟
         
-        // 【风格优化】根据 C# 静态只读字段命名规范，去掉下划线并首字母大写
-        private static readonly Dictionary<string, int> SessionTime = new Dictionary<string, int>(); 
-        private static readonly Dictionary<int, Dictionary<string, int>> BossDamageTracker = new Dictionary<int, Dictionary<string, int>>(); 
-        private static readonly Dictionary<string, Dictionary<int, int>> PersonalKillTracker = new Dictionary<string, Dictionary<int, int>>();
+        private static readonly string[] DyeGradientColors =
+        {
+            "7FFFD4", "40E0D0", "00FFFF", "66CDAA",
+            "FF69B4", "FF1493", "FFD700", "FFA500"
+        }; // 颜色带
+        // 渐变色彩生成器
+        private static string BuildAnimatedGradientText(string text)
+        {
+            var sb = new System.Text.StringBuilder();
+            
+            // 在调用的瞬间生成一个随机起始点
+            int startOffset = Rand.Next(DyeGradientColors.Length);
+
+            for (int i = 0; i < text.Length; i++)
+            {
+                // 从数组中取出颜色形成彩虹桥
+                string color = DyeGradientColors[(startOffset + i) % DyeGradientColors.Length];
+                sb.Append($"[c/{color}:{text[i]}]");
+            }
+
+            return sb.ToString();
+        }
+        
+        // 根据 C# 静态只读字段命名规范，去掉下划线并首字母大写
+        // 【核心修复】全部升级为工业级线程安全字典
+        private static readonly ConcurrentDictionary<string, int> SessionTime = new ConcurrentDictionary<string, int>(); 
+        private static readonly ConcurrentDictionary<int, ConcurrentDictionary<string, int>> BossDamageTracker = new ConcurrentDictionary<int, ConcurrentDictionary<string, int>>(); 
+        private static readonly ConcurrentDictionary<string, ConcurrentDictionary<int, int>> PersonalKillTracker = new ConcurrentDictionary<string, ConcurrentDictionary<int, int>>();
 
         // 事件 Boss 白名单 ID
         private static readonly HashSet<int> MiniBossIds = new HashSet<int>
@@ -40,27 +67,112 @@ namespace EpointPlugin
         };
         
         // ================= 盲盒配置 =================
+        // 独立的掉落物类：记录物品ID、掉落概率、单次掉落数量
+        private class BoxDrop
+        {
+            public int ItemId { get; init; }
+            public double Probability { get; init; } // 掉落概率 (0.0 ~ 1.0)
+            public int Stack { get; init; } = 1;     // 默认物品只给 1 个
+        }
+
         private class BlindBoxItem
         {
             public int Id { get; init; }
             public string Name { get; init; } = "";
-            public int IconItemId { get; init; } // 商店UI里展示的宝箱图标
-            public string ColorHex { get; init; } = "FFFFFF"; // 专属箱子颜色
-            public int DefaultPrice { get; init; } // 预设价格
-            public List<int> DropPool { get; init; } = new List<int>(); 
+            public int IconItemId { get; init; } 
+            public string ColorHex { get; init; } = "FFFFFF"; 
+            public int DefaultPrice { get; init; } 
+            public List<BoxDrop> DropPool { get; init; } = new List<BoxDrop>(); // 定义掉落池
 
-            // 调用 Price 时，优先从 Config 读取；若无配置，退回 DefaultPrice。
-            public int Price => Epoint.Config.BlindBoxPrices.TryGetValue(Id, out int p) ? p : DefaultPrice;
+            public int Price => Epoint.Config.BlindBoxPrices.GetValueOrDefault(Id, DefaultPrice);
         }
 
         private static readonly List<BlindBoxItem> BlindBoxes = new List<BlindBoxItem>
         {
-            new BlindBoxItem { Id = 101, Name = "宝箱怪盲盒", IconItemId = 306, ColorHex = "FFD700", DefaultPrice = 2000, DropPool = new List<int> { 437, 517, 536, 535, 554, 532 } }, 
-            new BlindBoxItem { Id = 102, Name = "冰雪宝箱怪盲盒", IconItemId = 681, ColorHex = "A5F2F3", DefaultPrice = 2000, DropPool = new List<int> { 727, 726, 679, 1312 } },
-            new BlindBoxItem { Id = 103, Name = "腐化宝箱怪盲盒", IconItemId = 1529, ColorHex = "9400D3", DefaultPrice = 2000, DropPool = new List<int> { 3014, 3012, 3013, 3015, 3011 } },
-            new BlindBoxItem { Id = 104, Name = "猩红宝箱怪盲盒", IconItemId = 1530, ColorHex = "DC143C", DefaultPrice = 2000, DropPool = new List<int> { 3008, 3010, 3009, 3016, 3007 } },
-            new BlindBoxItem { Id = 105, Name = "神圣宝箱怪盲盒", IconItemId = 1531, ColorHex = "FFB6C1", DefaultPrice = 2000, DropPool = new List<int> { 3029, 3020, 3023, 3030 } },
-            new BlindBoxItem { Id = 106, Name = "丛林宝箱怪盲盒", IconItemId = 1528, ColorHex = "32CD32", DefaultPrice = 2000, DropPool = new List<int> { 5360, 4953, 5324 } }
+            new BlindBoxItem { Id = 101, Name = "普通盲盒", IconItemId = 306, ColorHex = "D4AF37", DefaultPrice = 1500, DropPool = new List<BoxDrop> {
+                new BoxDrop { ItemId = 437, Probability = 1.0 / 6 },
+                new BoxDrop { ItemId = 517, Probability = 1.0 / 6 },
+                new BoxDrop { ItemId = 535, Probability = 1.0 / 6 },
+                new BoxDrop { ItemId = 536, Probability = 1.0 / 6 },
+                new BoxDrop { ItemId = 532, Probability = 1.0 / 6 },
+                new BoxDrop { ItemId = 554, Probability = 1.0 / 6 }
+            } },
+            new BlindBoxItem { Id = 102, Name = "冰雪盲盒", IconItemId = 681, ColorHex = "6ECFF6", DefaultPrice = 1500, DropPool = new List<BoxDrop> {
+                new BoxDrop { ItemId = 1312, Probability = 0.05 },
+                new BoxDrop { ItemId = 676, Probability = 0.95 / 3 },
+                new BoxDrop { ItemId = 1264, Probability = 0.95 / 3 },
+                new BoxDrop { ItemId = 725, Probability = 0.95 / 3 }
+            } },
+            new BlindBoxItem { Id = 103, Name = "丛林盲盒", IconItemId = 1528, ColorHex = "3A8F3A", DefaultPrice = 2500, DropPool = new List<BoxDrop> {
+                new BoxDrop { ItemId = 52, Probability = 0.1 },
+                new BoxDrop { ItemId = 1724, Probability = 0.1 },
+                new BoxDrop { ItemId = 2353, Probability = 0.1, Stack = 10 },
+                new BoxDrop { ItemId = 1922, Probability = 0.1 },
+                new BoxDrop { ItemId = 678, Probability = 0.1, Stack = 10 },
+                new BoxDrop { ItemId = 1336, Probability = 0.1 },
+                new BoxDrop { ItemId = 2676, Probability = 0.1, Stack = 5 },
+                new BoxDrop { ItemId = 2272, Probability = 0.1 },
+                new BoxDrop { ItemId = 5395, Probability = 0.1 },
+                new BoxDrop { ItemId = 4986, Probability = 0.1, Stack = 60 }
+            } },
+            new BlindBoxItem { Id = 104, Name = "腐化盲盒", IconItemId = 1529, ColorHex = "5A3FA0", DefaultPrice = 2500, DropPool = new List<BoxDrop> {
+                new BoxDrop { ItemId = 3014, Probability = 0.995 / 5 },
+                new BoxDrop { ItemId = 3008, Probability = 0.995 / 5 },
+                new BoxDrop { ItemId = 3012, Probability = 0.995 / 5 },
+                new BoxDrop { ItemId = 3015, Probability = 0.995 / 5 },
+                new BoxDrop { ItemId = 3023, Probability = 0.995 / 5 },
+                new BoxDrop { ItemId = 5489, Probability = 0.005 }
+            } },
+            new BlindBoxItem { Id = 105, Name = "猩红盲盒", IconItemId = 1530, ColorHex = "B03030", DefaultPrice = 2500, DropPool = new List<BoxDrop> {
+                new BoxDrop { ItemId = 3006, Probability = 0.995 / 5 },
+                new BoxDrop { ItemId = 3007, Probability = 0.995 / 5 },
+                new BoxDrop { ItemId = 3009, Probability = 0.995 / 5 },
+                new BoxDrop { ItemId = 3013, Probability = 0.995 / 5 },
+                new BoxDrop { ItemId = 3016, Probability = 0.995 / 5 },
+                new BoxDrop { ItemId = 5489, Probability = 0.005 }
+            } },
+            new BlindBoxItem { Id = 106, Name = "神圣盲盒", IconItemId = 1531, ColorHex = "F2A6FF", DefaultPrice = 2500, DropPool = new List<BoxDrop> {
+                new BoxDrop { ItemId = 3029, Probability = 0.995 / 4 },
+                new BoxDrop { ItemId = 3030, Probability = 0.995 / 4 },
+                new BoxDrop { ItemId = 3051, Probability = 0.995 / 4 },
+                new BoxDrop { ItemId = 3022, Probability = 0.995 / 4 },
+                new BoxDrop { ItemId = 5488, Probability = 0.005 }
+            } },
+            new BlindBoxItem { Id = 107, Name = "奇异染料盲盒", IconItemId = 1067, ColorHex = "", DefaultPrice = 1500, DropPool = new List<BoxDrop> {
+                new BoxDrop { ItemId = 3040, Probability = 0.65 / 14 },
+                new BoxDrop { ItemId = 3028, Probability = 0.65 / 14 },
+                new BoxDrop { ItemId = 3560, Probability = 0.65 / 14 },
+                new BoxDrop { ItemId = 3041, Probability = 0.65 / 14 },
+                new BoxDrop { ItemId = 3534, Probability = 0.65 / 14 },
+                new BoxDrop { ItemId = 2872, Probability = 0.65 / 14 },
+                new BoxDrop { ItemId = 3025, Probability = 0.65 / 14 },
+                new BoxDrop { ItemId = 3190, Probability = 0.65 / 14 },
+                new BoxDrop { ItemId = 3553, Probability = 0.65 / 14 },
+                new BoxDrop { ItemId = 3027, Probability = 0.65 / 14 },
+                new BoxDrop { ItemId = 3554, Probability = 0.65 / 14 },
+                new BoxDrop { ItemId = 3555, Probability = 0.65 / 14 },
+                new BoxDrop { ItemId = 3026, Probability = 0.65 / 14 },
+                new BoxDrop { ItemId = 2871, Probability = 0.65 / 14 },
+                new BoxDrop { ItemId = 2883, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 3561, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 3598, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 3038, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 3597, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 3600, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 2873, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 2869, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 2870, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 2864, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 3556, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 2879, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 3042, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 3533, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 3039, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 2878, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 2885, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 2884, Probability = 0.3 / 18 },
+                new BoxDrop { ItemId = 3024, Probability = 0.05 }
+            } }
         };
         
         // ================= 模块一：定时器管理 =================
@@ -156,11 +268,11 @@ namespace EpointPlugin
                 {
                     string msg;
                     if (luck > 1.15)
-                        msg = $"[c/00FF00:你感觉今天运气好极了！｡:.ﾟヽ(*´∀`)ﾉﾟ.:｡] 已连续签到 [c/FFD700:{newStreakDays}] [c/FFFFFF:天]，今日奖励 [c/FFD700:{actualReward}] ep";
+                        msg = $"[c/4CAF50:你感觉今天运气好极了！｡:.ﾟヽ(*´∀`)ﾉﾟ.:｡] 已连续签到 [c/FFD700:{newStreakDays}] [c/FFFFFF:天]，今日奖励 [c/FFD700:{actualReward}] ep";
                     else if (luck < 0.85)
-                        msg = $"[c/00FF00:似乎今天运气有点差 (☍﹏⁰。)] 已连续签到 [c/FFD700:{newStreakDays}] [c/FFFFFF:天]，今日奖励 [c/FFD700:{actualReward}] ep";
+                        msg = $"[c/7B3FBF:似乎今天运气有点差 (☍~⁰。)] 已连续签到 [c/FFD700:{newStreakDays}] [c/FFFFFF:天]，今日奖励 [c/FFD700:{actualReward}] ep";
                     else
-                        msg = $"[c/00FF00:签到成功 ～(∠・ω< )⌒★] 已连续签到 [c/FFD700:{newStreakDays}] [c/FFFFFF:天]，今日奖励 [c/FFD700:{actualReward}] ep";
+                        msg = $"[c/FFD700:签到成功 ～(∠・ω< )⌒★] 已连续签到 [c/FFD700:{newStreakDays}] [c/FFFFFF:天]，今日奖励 [c/FFD700:{actualReward}] ep";
 
                     player.SendMessage(msg, 255, 255, 255);
 
@@ -191,9 +303,10 @@ namespace EpointPlugin
         {
             args.Player.SendInfoMessage("==================== [c/FFD700:Epoint 积分插件帮助菜单] ====================");
             args.Player.SendMessage("/epinfo [c/FFFFFF:- 查看个人积分档案与签到状态]", 85, 210, 132);
-            args.Player.SendMessage("/epshop [页码](留空则取1) [c/FFFFFF:- 打开积分商店 (第 1 页道具商店，第 2 页盲盒商店)]", 85, 210, 132);
-            args.Player.SendMessage("/epbuy <商品序号> [购买次数](留空则取1) [c/FFFFFF:- 购买商品]", 85, 210, 132);
-            args.Player.SendMessage("[c/55CDFF:积分获取途径：][c/FFFFFF:每日首次登录、累积在线时长、击败Boss奖励、击杀小怪里程碑奖励。]", 85, 210, 132);
+            args.Player.SendMessage("/eprank [c/FFFFFF:- 查看玩家积分排行榜]", 85, 210, 132);
+            args.Player.SendMessage("/epshop [页码][c/AAAAAA:(留空默认取1)][c/FFFFFF: - 打开积分商店 (第 1 页道具商店，第 2 页盲盒商店)]", 85, 210, 132);
+            args.Player.SendMessage("/epbuy <商品序号> [购买次数][c/AAAAAA:(留空默认取1)][c/FFFFFF: - 购买商品]", 85, 210, 132);
+            args.Player.SendMessage("[c/55CDFF:积分获取途径：][c/FFD700:每日首次登录、累积在线时长、击败Boss奖励、击杀小怪里程碑奖励。]", 85, 210, 132);
         }
 
         // 计算文字的视觉宽度以便排版
@@ -260,7 +373,7 @@ namespace EpointPlugin
                     return;
                 }
                 
-                args.Player.SendInfoMessage("================= [c/FFD700:Epoint 道具商店] =================");
+                args.Player.SendInfoMessage("=================== [c/FFD700:Epoint 道具商店] ===================");
 
                 // 道具全部在第一页渲染
                 for (int i = 0; i < items.Count; i += 3) // 控制每行三列
@@ -283,14 +396,15 @@ namespace EpointPlugin
                     args.Player.SendMessage(line, 255, 255, 255); 
                 }
 
+                args.Player.SendInfoMessage("");
                 args.Player.SendInfoMessage("[c/FF7E7E:(注：红色序号为限购商品)]");
-                args.Player.SendInfoMessage("================================================");
+                args.Player.SendInfoMessage("==================================================");
                 args.Player.SendMessage($"[c/FFFFFF:积分余额：]{currentPoints} ep [c/FFFFFF:|] [c/55CDFF:第 1 页] [c/FFFFFF:(输入] /epshop 2 [c/FFFFFF:查看盲盒商店)]", 85, 210, 132);
             }
             
             else // ============ 第二页：盲盒商店 ============
             {
-                args.Player.SendInfoMessage("================= [c/FFD700:Epoint 盲盒商店] =================");
+                args.Player.SendInfoMessage("=================== [c/FFD700:Epoint 盲盒商店] ===================");
                 
                 // 进度锁提示
                 if (!Main.hardMode)
@@ -300,14 +414,15 @@ namespace EpointPlugin
                 
                 foreach (var box in BlindBoxes)
                 {
-                    string drops = string.Join("", box.DropPool.Select(id => $"[i:{id}]"));
+                    string drops = box.Id == 107 ? "[c/AAAAAA:种类过多不逐一展示]" : string.Join("", box.DropPool.Select(d => d.Stack > 1 ? $"[i/s{d.Stack}:{d.ItemId}]" : $"[i:{d.ItemId}]"));
+                    string boxName = box.Id == 107 ? BuildAnimatedGradientText(box.Name) : $"[c/{box.ColorHex}:{box.Name}]";
                     // 格式: (序号) XX盲盒[图标] XX ep | (可能包含的物品: [图标][图标]...)
-                    string line = $"[c/FF7E7E:({box.Id})] [c/{box.ColorHex}:{box.Name}][i:{box.IconItemId}] [c/00FF00:{box.Price} ep] [c/FFFFFF:| (可能包含的物品: ]{drops}[c/FFFFFF:)]";
+                    string line = $"[c/FF7E7E:({box.Id})] {boxName}[i:{box.IconItemId}] [c/00FF00:{box.Price} ep] [c/FFFFFF:| (可能包含的物品: ]{drops}[c/FFFFFF:)]";
                     args.Player.SendMessage(line, 255, 255, 255);
                 }
                 
-                args.Player.SendInfoMessage("================================================");
-                args.Player.SendMessage($"[c/FFFFFF:积分余额：]{currentPoints} ep [c/FFFFFF:|] [c/55CDFF:第 1 页] [c/FFFFFF:(输入] /epshop 1 [c/FFFFFF:返回积分商店)]", 85, 210, 132);
+                args.Player.SendInfoMessage("==================================================");
+                args.Player.SendMessage($"[c/FFFFFF:积分余额：]{currentPoints} ep [c/FFFFFF:|] [c/55CDFF:第 1 页] [c/FFFFFF:(输入] /epshop 1 [c/FFFFFF:返回道具商店)]", 85, 210, 132);
             }
         }
         
@@ -401,14 +516,91 @@ namespace EpointPlugin
             {
                 for (int k = 0; k < buyTimes; k++)
                 {
-                    int dropId = blindBox.DropPool[Rand.Next(blindBox.DropPool.Count)];
-                    args.Player.GiveItem(dropId, 1);
+                    // ===== 抽卡概率算法 =====
+                    double r = Rand.NextDouble(); // 生成 0.0 ~ 1.0 的随机数
+                    double cumulative = 0.0;
+                    BoxDrop? selectedDrop = null;
+                    
+                    foreach (var drop in blindBox.DropPool)
+                    {
+                        cumulative += drop.Probability;
+                        if (r <= cumulative)
+                        {
+                            selectedDrop = drop;
+                            break;
+                        }
+                    }
+                    // 如果因为计算机浮点数精度误差没抽到，就给奖池的最后一个物品
+                    selectedDrop ??= blindBox.DropPool.Last();
+
+                    // 发放物品
+                    args.Player.GiveItem(selectedDrop.ItemId, selectedDrop.Stack);
+                    
+                    // 广播物品展示标签
+                    string dropTag = selectedDrop.Stack > 1 ? $"[i/s{selectedDrop.Stack}:{selectedDrop.ItemId}]" : $"[i:{selectedDrop.ItemId}]";
+                    // 拦截染料盲盒，将其广播名字套上流光特效
+                    string boxNameDisplay = blindBox.Id == 107 ? BuildAnimatedGradientText(blindBox.Name) : $"[c/{blindBox.ColorHex}:{blindBox.Name}]";
                     // 全服广播开盲盒结果
-                    TSPlayer.All.SendMessage($"[c/55CDFF:{accountName}] 开启了 [c/{blindBox.ColorHex}:{blindBox.Name}]，获得了 [i:{dropId}]", 255, 255, 255);
+                    TSPlayer.All.SendMessage($"[c/55CDFF:{accountName}] 开启了 {boxNameDisplay}，获得了 {dropTag}", 255, 255, 255);
                 }
             }
         }
 
+        // 积分排行榜模块 (后台异步防卡顿计算)
+        public static void EpRankCommand(CommandArgs args)
+        {
+            Task.Run(() =>
+            {
+                try
+                {
+                    string playersDir = Path.Combine(TShock.SavePath, "epoint", "players");
+                    if (!Directory.Exists(playersDir)) return;
+
+                    var files = Directory.GetFiles(playersDir, "*.json");
+                    var rankList = new List<PlayerAccount>();
+
+                    // 读取所有玩家档案
+                    foreach (var file in files)
+                    {
+                        try
+                        {
+                            string json = File.ReadAllText(file);
+                            var account = JsonConvert.DeserializeObject<PlayerAccount>(json); 
+                            if (account != null) rankList.Add(account);
+                        }
+                        catch { /* 忽略损坏的文件 */ }
+                    }
+
+                    // 取积分最高的 Top 10
+                    var topPlayers = rankList.OrderByDescending(p => p.Points).Take(10).ToList();
+
+                    args.Player.SendMessage("======== Epoint 积分排行榜 ========", 255, 215, 0);
+                    
+                    if (topPlayers.Count == 0)
+                    {
+                        args.Player.SendInfoMessage("暂无玩家数据");
+                        return;
+                    }
+
+                    for (int i = 0; i < topPlayers.Count; i++)
+                    {
+                        string rankColor = i switch
+                        {
+                            0 => "FFD700",
+                            1 => "C0C0C0",
+                            2 => "CD7F32",
+                            _ => "FFFFFF"
+                        };
+                        args.Player.SendMessage($"[c/{rankColor}:Top {i + 1}.] {topPlayers[i].PlayerName} - [c/00FF00:{topPlayers[i].Points} ep]", 255, 255, 255);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    args.Player.SendErrorMessage($"[Epoint] 排行榜读取失败: {ex.Message}");
+                }
+            });
+        }
+        
         // ================= 模块三：自动事件钩子监听 =================
 
         // 玩家刚输入完登录密码触发
@@ -423,31 +615,37 @@ namespace EpointPlugin
             TryDailySignIn(player, accountName, true); // true 代表延迟2秒发消息
         }
         
-        // 累计在线时长定时器到点触发
+        // 累计在线时长定时器逻辑
         private static void OnOnlineTimerElapsed(object? sender, ElapsedEventArgs e)
         {
-            // 遍历整个服务器里的所有人
+            // 获取当前真实存活的玩家账号哈希表，用于校验
+            var activeAccounts = TShock.Players
+                .Where(p => p is { Active: true, IsLoggedIn: true })
+                .Select(p => p.Account.Name)
+                .ToHashSet();
+
+            // 清理非正常掉线的幽灵数据
+            foreach (var account in SessionTime.Keys)
+            {
+                if (!activeAccounts.Contains(account)) SessionTime.TryRemove(account, out _);
+            }
+
+            // 遍历服务器里的所有玩家
             foreach (var player in TShock.Players)
             {
-                if (player == null || !player.Active || !player.IsLoggedIn) continue; // 没登录的忽略
+                if (player == null || !player.Active || !player.IsLoggedIn) continue;
 
                 string accountName = player.Account.Name;
                 TryDailySignIn(player, accountName);
                 
-                SessionTime.TryAdd(accountName, 0);
-                
-                // 给该玩家累加在线时长
-                SessionTime[accountName] += Epoint.Config.OnlineRewardInterval;
+                // 修改并发安全，原子化累加在线时长
+                SessionTime.AddOrUpdate(accountName, Epoint.Config.OnlineRewardInterval, (_, v) => v + Epoint.Config.OnlineRewardInterval);
 
                 var data = Epoint.Data.GetPlayerData(accountName);
-                
                 int effectiveDays = Math.Max(0, data.TotalDays - 1);
                 double daysCoeff = 1.0 + (effectiveDays * 0.05);
 
-                // 保留了快节奏模式的判定，在线积分取决于 Config 中的设定
                 int theoreticalReward = Epoint.Config.FastPacedMode ? Epoint.Config.OnlineRewardPoints * 2 : Epoint.Config.OnlineRewardPoints;
-
-                // 计算今日所剩可获得积分额度，防止多发
                 int baseCap = Epoint.Config.FastPacedMode ? Epoint.Config.BaseDailyCap * 2 : Epoint.Config.BaseDailyCap;
                 int dailyCap = (int)(baseCap * daysCoeff);
                 int remainingCap = dailyCap - data.PointsToday;
@@ -464,7 +662,6 @@ namespace EpointPlugin
                     Epoint.Data.SavePlayerData(data); 
                     
                     string capSuffix = (data.PointsToday >= dailyCap) ? " [c/FF0000:(今日积分已达上限！)]" : "";
-                    
                     player.SendSuccessMessage($"[c/55CDFF:叮咚～(∠・ω< )⌒★] [c/87CEEB:在线奖励] [c/FFD700:{actualReward}] ep{capSuffix}");
                 }
             }
@@ -477,8 +674,8 @@ namespace EpointPlugin
             if (player is { Active: true, IsLoggedIn: true })
             {
                 // 清理该玩家占用的内存数据字典
-                SessionTime.Remove(player.Account.Name);
-                PersonalKillTracker.Remove(player.Account.Name);
+                SessionTime.TryRemove(player.Account.Name, out _);
+                PersonalKillTracker.TryRemove(player.Account.Name, out _);
             }
         }
         
@@ -495,13 +692,11 @@ namespace EpointPlugin
             string accountName = player.Account.Name;
             
             // 在记录伤害时，多部件 Boss 统一映射到其核心本体 ID 上
-            int bossKey = npc.realLife >= 0 ? npc.realLife : args.ID;
+            int bossKey = npc.realLife >= 0 ? npc.realLife : npc.whoAmI;
             
-            // 确保这只Boss的字典存在，然后把伤害累加进去
-            BossDamageTracker.TryAdd(bossKey, new Dictionary<string, int>());
-            BossDamageTracker[bossKey].TryAdd(accountName, 0);
-            
-            BossDamageTracker[bossKey][accountName] += args.Damage;
+            // 确保内部字典存在，并原子化累加伤害
+            var bossDict = BossDamageTracker.GetOrAdd(bossKey, _ => new ConcurrentDictionary<string, int>());
+            bossDict.AddOrUpdate(accountName, args.Damage, (_, v) => v + args.Damage);
         }
 
         // 服务器里有怪物被击杀了会触发这个钩子
@@ -551,7 +746,7 @@ namespace EpointPlugin
                 }
                 
                 // 积分分配完成，把这只 Boss 的伤害数据从内存删掉
-                BossDamageTracker.Remove(bossKey);
+                BossDamageTracker.TryRemove(bossKey, out _);
                 return; 
             }
 
@@ -570,12 +765,9 @@ namespace EpointPlugin
             
             int netId = npc.netID;
 
-            // 在该玩家的个人字典里，把这只怪的击杀数 +1
-            PersonalKillTracker.TryAdd(killerAccount, new Dictionary<int, int>());
-            PersonalKillTracker[killerAccount].TryAdd(netId, 0);
-
-            PersonalKillTracker[killerAccount][netId]++;
-            int personalKills = PersonalKillTracker[killerAccount][netId];
+            // 在玩家的个人字典里原子化累加击杀数
+            var killDict = PersonalKillTracker.GetOrAdd(killerAccount, _ => new ConcurrentDictionary<int, int>());
+            int personalKills = killDict.AddOrUpdate(netId, 1, (_, v) => v + 1);
             
             // 如果累计击杀了 50 只 (或是 100, 150...)
             if (personalKills > 0 && personalKills % 50 == 0)

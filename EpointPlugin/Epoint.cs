@@ -57,6 +57,7 @@ namespace EpointPlugin
             Commands.ChatCommands.Add(new Command("epoint.admin", ReloadConfig, "epreload"));
             Commands.ChatCommands.Add(new Command("", EpointSystem.EpHelpCommand, "ephelp"));
             Commands.ChatCommands.Add(new Command("", EpointSystem.EpInfoCommand, "epinfo"));
+            Commands.ChatCommands.Add(new Command("", EpointSystem.EpRankCommand, "eprank"));
             Commands.ChatCommands.Add(new Command("", EpointSystem.EpShopCommand, "epshop"));
             Commands.ChatCommands.Add(new Command("", EpointSystem.EpBuyCommand, "epbuy"));
 
