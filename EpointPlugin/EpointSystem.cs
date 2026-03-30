@@ -83,8 +83,9 @@ namespace EpointPlugin
             public string ColorHex { get; init; } = "FFFFFF"; 
             public int DefaultPrice { get; init; } 
             public List<BoxDrop> DropPool { get; init; } = new List<BoxDrop>(); // 定义掉落池
-
-            public int Price => Epoint.Config.BlindBoxPrices.GetValueOrDefault(Id, DefaultPrice);
+            
+            // 通过盲盒 Name 去配置文件里匹配价格
+            public int Price => Epoint.Config.BlindBoxPrices.FirstOrDefault(b => b.Name == Name)?.Price ?? DefaultPrice;
         }
 
         private static readonly List<BlindBoxItem> BlindBoxes = new List<BlindBoxItem>
@@ -185,17 +186,24 @@ namespace EpointPlugin
             _onlineTimer.AutoReset = true; // 允许无限循环跳动
             _onlineTimer.Start();
             
-            // 每 60 秒执行一次全服静默查岗
+            // 每 60 秒执行一次
             _autoSignInTimer = new System.Timers.Timer(60000);
-            // 使用弃元 "_" 忽略不需要的参数
             _autoSignInTimer.Elapsed += (_, _) =>
             {
+                // 自动签到与心跳查岗
                 foreach (var player in TShock.Players)
                 {
                     if (player is { Active: true, IsLoggedIn: true })
                     {
                         TryDailySignIn(player, player.Account.Name);
                     }
+                }
+                
+                // 定期清理因为自然消失、逃跑而遗留在内存里的幽灵 Boss 数据
+                var deadBossKeys = BossDamageTracker.Keys.Where(k => Main.npc[k] == null || !Main.npc[k].active).ToList();
+                foreach (var key in deadBossKeys)
+                {
+                    BossDamageTracker.TryRemove(key, out _);
                 }
             };
             _autoSignInTimer.AutoReset = true;
@@ -210,6 +218,10 @@ namespace EpointPlugin
             // 释放心跳时钟
             _autoSignInTimer?.Stop();
             _autoSignInTimer?.Dispose();
+            // 释放所有静态集合，防止重载时内存泄漏
+            SessionTime.Clear();
+            BossDamageTracker.Clear();
+            PersonalKillTracker.Clear();
         }
         
         // 修改配置文件后，重启时钟让新时间生效
@@ -241,7 +253,7 @@ namespace EpointPlugin
 
             // 每日签到积分奖励计算
             int effectiveDaysForCap = Math.Max(0, data.TotalDays); // 累计登录天数
-            double daysCoeff = 1.0 + (effectiveDaysForCap * 0.05); // 累计登录系数
+            double daysCoeff = 1.0 + (effectiveDaysForCap * 0.1); // 累计登录系数
             
             int baseCap = Epoint.Config.FastPacedMode ? Epoint.Config.BaseDailyCap * 2 : Epoint.Config.BaseDailyCap; // 每日获取积分上限基数
             int dailyCap = (int)(baseCap * daysCoeff); // 每日获取积分上限
@@ -287,7 +299,10 @@ namespace EpointPlugin
                 Task.Run(async () =>
                 {
                     await Task.Delay(2000);
-                    SendMessage();
+                    if (player is { Active: true, IsLoggedIn: true } && player.Account.Name == accountName)
+                    {
+                        SendMessage();
+                    }
                 });
             }
             else
@@ -414,7 +429,7 @@ namespace EpointPlugin
                 
                 foreach (var box in BlindBoxes)
                 {
-                    string drops = box.Id == 107 ? "[c/AAAAAA:种类过多不逐一展示]" : string.Join("", box.DropPool.Select(d => d.Stack > 1 ? $"[i/s{d.Stack}:{d.ItemId}]" : $"[i:{d.ItemId}]"));
+                    string drops = box.Id == 107 ? "[c/AAAAAA:内含 33 种奇异染料]" : string.Join("", box.DropPool.Select(d => d.Stack > 1 ? $"[i/s{d.Stack}:{d.ItemId}]" : $"[i:{d.ItemId}]"));
                     string boxName = box.Id == 107 ? BuildAnimatedGradientText(box.Name) : $"[c/{box.ColorHex}:{box.Name}]";
                     // 格式: (序号) XX盲盒[图标] XX ep | (可能包含的物品: [图标][图标]...)
                     string line = $"[c/FF7E7E:({box.Id})] {boxName}[i:{box.IconItemId}] [c/00FF00:{box.Price} ep] [c/FFFFFF:| (可能包含的物品: ]{drops}[c/FFFFFF:)]";
@@ -564,8 +579,11 @@ namespace EpointPlugin
                     {
                         try
                         {
-                            string json = File.ReadAllText(file);
-                            var account = JsonConvert.DeserializeObject<PlayerAccount>(json); 
+                            using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                            using var reader = new StreamReader(stream);
+
+                            string json = reader.ReadToEnd();
+                            var account = JsonConvert.DeserializeObject<PlayerAccount>(json);
                             if (account != null) rankList.Add(account);
                         }
                         catch { /* 忽略损坏的文件 */ }
@@ -645,7 +663,31 @@ namespace EpointPlugin
                 int effectiveDays = Math.Max(0, data.TotalDays - 1);
                 double daysCoeff = 1.0 + (effectiveDays * 0.05);
 
-                int theoreticalReward = Epoint.Config.FastPacedMode ? Epoint.Config.OnlineRewardPoints * 2 : Epoint.Config.OnlineRewardPoints;
+                // ================= 在线奖励暴击算法 =================
+                double randLucky = Rand.NextDouble();
+                int baseOnlineReward;
+                string msgPrefix;
+
+                if (randLucky < 0.04) // 4% 概率：超级暴击
+                {
+                    baseOnlineReward = 50;
+                    msgPrefix = "[c/87CEEB:在线奖励超级暴击！！]";
+                }
+                else if (randLucky < 0.14) // 10% 概率：普通暴击
+                {
+                    baseOnlineReward = 30;
+                    msgPrefix = "[c/87CEEB:在线奖励暴击！]";
+                }
+                else // 86% 概率：正常奖励
+                {
+                    baseOnlineReward = 10;
+                    msgPrefix = "[c/87CEEB:在线奖励]";
+                }
+
+                // 快节奏模式双倍加成
+                int theoreticalReward = Epoint.Config.FastPacedMode ? baseOnlineReward * 2 : baseOnlineReward;
+
+                // ================= 积分拦截与发放 =================
                 int baseCap = Epoint.Config.FastPacedMode ? Epoint.Config.BaseDailyCap * 2 : Epoint.Config.BaseDailyCap;
                 int dailyCap = (int)(baseCap * daysCoeff);
                 int remainingCap = dailyCap - data.PointsToday;
@@ -662,7 +704,8 @@ namespace EpointPlugin
                     Epoint.Data.SavePlayerData(data); 
                     
                     string capSuffix = (data.PointsToday >= dailyCap) ? " [c/FF0000:(今日积分已达上限！)]" : "";
-                    player.SendSuccessMessage($"[c/55CDFF:叮咚～(∠・ω< )⌒★] [c/87CEEB:在线奖励] [c/FFD700:{actualReward}] ep{capSuffix}");
+                    
+                    player.SendSuccessMessage($"[c/55CDFF:叮咚～(∠・ω< )⌒★] {msgPrefix} [c/FFD700:{actualReward}] ep{capSuffix}");
                 }
             }
         }
@@ -679,7 +722,7 @@ namespace EpointPlugin
             }
         }
         
-        // 服务器里有 NPC 被打了会触发这个钩子
+        // 服务器里如果有 NPC 被打则会触发这个钩子
         public static void OnNpcStrike(object? sender, GetDataHandlers.NPCStrikeEventArgs args)
         {
             var player = args.Player;
@@ -687,31 +730,68 @@ namespace EpointPlugin
 
             if (!player.Active || !player.IsLoggedIn) return;
             if (!npc.active) return;
-            if (!npc.boss && !MiniBossIds.Contains(npc.netID)) return; // 忽略既不是原版 Boss 也不在特殊小头目白名单里的敌怪
+            
+            bool isEow = npc.netID is 13 or 14 or 15; // 识别世界吞噬怪的体节 (13=头, 14=身, 15=尾)
+            if (!npc.boss && !MiniBossIds.Contains(npc.netID) && !isEow) return; // 忽略既不是原版 Boss 也不在特殊小头目白名单里的敌怪
             
             string accountName = player.Account.Name;
             
             // 在记录伤害时，多部件 Boss 统一映射到其核心本体 ID 上
-            int bossKey = npc.realLife >= 0 ? npc.realLife : npc.whoAmI;
+            int bossKey;
+            if (isEow) 
+            {
+                bossKey = -13; // 世吞单独处理：将所有世吞体节虚拟统合在 ID-13 上
+            }
+            else 
+            {
+                bossKey = npc.realLife >= 0 ? npc.realLife : npc.whoAmI;
+            }
             
             // 确保内部字典存在，并原子化累加伤害
             var bossDict = BossDamageTracker.GetOrAdd(bossKey, _ => new ConcurrentDictionary<string, int>());
             bossDict.AddOrUpdate(accountName, args.Damage, (_, v) => v + args.Damage);
         }
 
-        // 服务器里有怪物被击杀了会触发这个钩子
+        // 服务器里如果有怪物被击杀则会触发这个钩子
         public static void OnNpcKilled(NpcKilledEventArgs args)
         {
             var npc = args.npc;
-            // 获取导致该事件触发的 npc 索引，不用关心是哪个部件死的
-            int bossKey = npc.realLife >= 0 ? npc.realLife : npc.whoAmI; // Boss统一ID
+            int netId = npc.netID;
+            bool isEow = netId is 13 or 14 or 15;
 
             // ---- 情况A：击杀 Boss 或 特殊小头目 ----
-            if (npc.boss || MiniBossIds.Contains(npc.netID))
+            if (npc.boss || MiniBossIds.Contains(netId) || isEow)
             {
-                // Boss 非线性平滑奖励函数
-                int baseBossPool = (int)(400 * (1 - Math.Exp(-npc.lifeMax / 15000.0)));
-                baseBossPool = Math.Clamp(baseBossPool, 100, 400);
+                // 在 Boss 结算的最开始遍历一次当前所有合法的在线玩家存入缓存列表
+                var activePlayers = TShock.Players.Where(p => p is { Active: true, IsLoggedIn: true, Account: not null }).ToList();
+                
+                int bossKey;
+                int baseBossPool;
+                string bossName;
+
+                if (isEow)
+                {
+                    // 世吞单独处理：检查全图是否还有其他存活的世吞体节，条件 n.whoAmI != npc.whoAmI 排除掉当前正在死亡的这块体节
+                    bool eowAlive = Main.npc.Any(n => n is { active: true, netID: 13 or 14 or 15 } && n.whoAmI != npc.whoAmI);
+                    if (eowAlive) return;
+
+                    bossKey = -13;
+                    bossName = "世界吞噬怪";
+                    
+                    // 单独计算世吞血量上限
+                    int playerCount = activePlayers.Count;
+                    double dynamicLifeMax = 10000 * (1.0 + Math.Max(0, playerCount - 1) * 0.35);
+                    
+                    baseBossPool = (int)(400 * (1 - Math.Exp(-dynamicLifeMax / 15000.0))); // Boss 非线性平滑奖励函数
+                }
+                else
+                {
+                    bossKey = npc.realLife >= 0 ? npc.realLife : npc.whoAmI;
+                    bossName = npc.FullName;
+                    baseBossPool = (int)(400 * (1 - Math.Exp(-npc.lifeMax / 15000.0))); // Boss 非线性平滑奖励函数
+                }
+                
+                baseBossPool = Math.Clamp(baseBossPool, 100, 400); // 调整 Boss 奖励上下限
                 
                 if (Epoint.Config.BossRewardByDamage)
                 {
@@ -724,30 +804,23 @@ namespace EpointPlugin
                             string accountName = kvp.Key;
                             double damagePercent = (double)kvp.Value / totalDamage;
                             
-                            // 遍历在线玩家，找到参战玩家并分配积分
-                            var player = TShock.Players.FirstOrDefault(p =>
-                                p is { Active: true, IsLoggedIn: true, Account: not null }
-                                && p.Account.Name == accountName);
-                            if (player != null) GrantBossReward(player, accountName, baseBossPool, damagePercent, npc.FullName);
+                            var p = activePlayers.FirstOrDefault(pl => pl.Account.Name == accountName);
+                            if (p != null) GrantBossReward(p, accountName, baseBossPool, damagePercent, bossName);
                         }
                     }
                 }
                 else
                 {
                     // 模式2：只要在线的登录玩家，全部平分奖励积分池
-                    var activePlayers = TShock.Players
-                        .Where(p => p is { Active: true, IsLoggedIn: true })
-                        .ToList();
                     if (activePlayers.Count > 0)
                     {
                         double equalPercent = 1.0 / activePlayers.Count;
-                        foreach (var player in activePlayers) GrantBossReward(player, player.Account.Name, baseBossPool, equalPercent, npc.FullName);
+                        foreach (var p in activePlayers) GrantBossReward(p, p.Account.Name, baseBossPool, equalPercent, bossName);
                     }
                 }
                 
-                // 积分分配完成，把这只 Boss 的伤害数据从内存删掉
-                BossDamageTracker.TryRemove(bossKey, out _);
-                return; 
+                BossDamageTracker.TryRemove(bossKey, out _); // 积分分配完成，把这只 Boss 的伤害数据从内存删掉
+                return;
             }
 
             // ---- 情况B：击杀小怪(记录里程碑) ----
@@ -762,8 +835,6 @@ namespace EpointPlugin
 
             string killerAccount = killerPlayer.Account.Name;
             TryDailySignIn(killerPlayer, killerAccount);
-            
-            int netId = npc.netID;
 
             // 在玩家的个人字典里原子化累加击杀数
             var killDict = PersonalKillTracker.GetOrAdd(killerAccount, _ => new ConcurrentDictionary<int, int>());
@@ -795,8 +866,8 @@ namespace EpointPlugin
 
                 Task.Run(async () =>
                 {
-                    await Task.Delay(1500);
-                    if (killerPlayer.Active && actualReward > 0)
+                    await Task.Delay(2000);
+                    if (killerPlayer is { Active: true, IsLoggedIn: true } && killerPlayer.Account.Name == killerAccount && actualReward > 0)
                     {
                         Epoint.Data.AddPoints(killerAccount, actualReward);
                         
