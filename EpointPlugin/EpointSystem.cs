@@ -398,13 +398,13 @@ namespace EpointPlugin
             if (!string.IsNullOrEmpty(vipName))
                 args.Player.SendMessage($"[c/FFD700:会员等级:] [c/{vipColor}:{vipName}]", 255, 255, 255);
             args.Player.SendSuccessMessage($"[c/FFD700:积分余额:] {points} ep");
-            args.Player.SendMessage($"[c/A32CC4:灵韵积分:] {charmPoints} cp", 255, 255, 255);
+            args.Player.SendMessage($"[c/A32CC4:灵韵积分:] [c/FF6EC7:{charmPoints} cp]", 255, 255, 255);
             args.Player.SendSuccessMessage($"[c/FFA500:今日获取:] {pointsToday} / {dailyCap} ep");
             args.Player.SendInfoMessage($"[c/55CDFF:累积登录:] {totalDays} [c/FFFFFF:天]");
             args.Player.SendInfoMessage($"[c/87CEEB:连续签到:] {streakDays} [c/FFFFFF:天]");
             
-            args.Player.SendMessage($"[c/A9A9A9:已累计获取积分:] {totalEarned} ep", 255, 255, 255);
-            args.Player.SendMessage($"[c/A9A9A9:已累计消费积分:] {totalSpent} ep", 255, 255, 255);
+            args.Player.SendMessage($"[c/A9A9A9:已累计获取积分:] {totalEarned} [c/A9A9A9:ep]", 255, 255, 255);
+            args.Player.SendMessage($"[c/A9A9A9:已累计消费积分:] {totalSpent} [c/A9A9A9:ep]", 255, 255, 255);
         }
 
         /// <summary>
@@ -485,7 +485,7 @@ namespace EpointPlugin
                         }
                         else
                         {
-                            priceDisplayTag = $"[c/00FF00:{item.Price} ep]";
+                            priceDisplayTag = $"[c/66FFB2:{item.Price} ep]";
                             rawDisplayStr = $"({item.Id}) {item.Price} ep";
                         }
                         
@@ -508,14 +508,14 @@ namespace EpointPlugin
                 
                 foreach (var box in BlindBoxes)
                 {
-                    string drops = box.Id == 107 ? "[c/AAAAAA:33 种奇异染料]" : string.Join("", box.DropPool.Select(d => d.Stack > 1 ? $"[i/s{d.Stack}:{d.ItemId}]" : $"[i:{d.ItemId}]"));
-                    string boxName = box.Id == 107 ? BuildAnimatedGradientText(box.Name) : $"[c/{box.ColorHex}:{box.Name}]";
+                    string drops = box.Id == 207 ? "[c/AAAAAA:33 种奇异染料]" : string.Join("", box.DropPool.Select(d => d.Stack > 1 ? $"[i/s{d.Stack}:{d.ItemId}]" : $"[i:{d.ItemId}]"));
+                    string boxName = box.Id == 207 ? BuildAnimatedGradientText(box.Name) : $"[c/{box.ColorHex}:{box.Name}]";
                     
                     int basePrice = box.Price;
                     int finalPrice = (int)(basePrice * vipMult);
                     string priceTag = finalPrice < basePrice ? $"[c/FFD700:{finalPrice} ep]" : $"[c/00FF00:{basePrice} ep]";
 
-                    string line = $"[c/FF7E7E:({box.Id})] {boxName}[i:{box.IconItemId}] {priceTag} [c/FFFFFF:| (可能包含的物品: ]{drops}[c/FFFFFF:)]";
+                    string line = $"[c/FFFFFF:({box.Id})] {boxName}[i:{box.IconItemId}] {priceTag} [c/FFFFFF:| (可能包含的物品: ]{drops}[c/FFFFFF:)]";
                     args.Player.SendMessage(line, 255, 255, 255);
                 }
                 
