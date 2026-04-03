@@ -1,279 +1,317 @@
 ﻿using System;
+using System.IO;
+using System.Linq;
+using System.Timers;
+using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
-using System.Linq;
-using System.Threading.Tasks;
-using System.IO;
-using System.Timers;
 using Terraria;
 using TerrariaApi.Server;
+using On.Terraria.GameContent; 
 using TShockAPI;
 using TShockAPI.Hooks;
 using Newtonsoft.Json;
 
 namespace EpointPlugin
 {
-    // =========================================================================
-    // [业务逻辑中心] 负责将所有的计算、指令判断、事件监听
-    // =========================================================================
+    /// <summary>
+    /// [积分系统核心模块]
+    /// 管理在线奖励、签到、商店购买、盲盒抽取、Boss/小怪击杀奖励等积分获取逻辑
+    /// 数据持久化通过 Epoint.Data 完成，定时器和事件钩子在此类中初始化
+    /// </summary>
     public static class EpointSystem
     {
-        private static readonly Random Rand = new Random(); // 随机数生成器（用于运气波动计算）
-        private static System.Timers.Timer? _onlineTimer;   // 负责定时发放在线奖励的时钟
-        private static System.Timers.Timer? _autoSignInTimer; // 负责自动发放签到奖励的时钟
+        // 随机数生成器，用于签到运气、积分暴击、盲盒抽取等概率判定
+        private static readonly Random Rand = new Random(); 
+        // 在线奖励计时器，按配置间隔触发
+        private static System.Timers.Timer? _onlineTimer;   
+        // 自动签到及全局数据刷写计时器，每分钟执行一次
+        private static System.Timers.Timer? _autoSignInTimer; 
         
+        // 动态渐变文本的颜色列表，用于盲盒名称等特效显示
         private static readonly string[] DyeGradientColors =
         {
-            "7FFFD4", "40E0D0", "00FFFF", "66CDAA",
-            "FF69B4", "FF1493", "FFD700", "FFA500"
-        }; // 颜色带
-        // 渐变色彩生成器
+            "7FFFD4", "40E0D0", "00FFFF", "66CDAA", "FF69B4", "FF1493", "FFD700", "FFA500"
+        }; 
+        
+        /// <summary>
+        /// 生成带颜色渐变效果的文本，每个字符独立取色，起始偏移随机
+        /// </summary>
         private static string BuildAnimatedGradientText(string text)
         {
             var sb = new System.Text.StringBuilder();
-            
-            // 在调用的瞬间生成一个随机起始点
             int startOffset = Rand.Next(DyeGradientColors.Length);
-
             for (int i = 0; i < text.Length; i++)
             {
-                // 从数组中取出颜色形成彩虹桥
                 string color = DyeGradientColors[(startOffset + i) % DyeGradientColors.Length];
                 sb.Append($"[c/{color}:{text[i]}]");
             }
-
             return sb.ToString();
         }
         
-        // 根据 C# 静态只读字段命名规范，去掉下划线并首字母大写
-        // 【核心修复】全部升级为工业级线程安全字典
-        private static readonly ConcurrentDictionary<string, int> SessionTime = new ConcurrentDictionary<string, int>(); 
-        private static readonly ConcurrentDictionary<int, ConcurrentDictionary<string, int>> BossDamageTracker = new ConcurrentDictionary<int, ConcurrentDictionary<string, int>>(); 
-        private static readonly ConcurrentDictionary<string, ConcurrentDictionary<int, int>> PersonalKillTracker = new ConcurrentDictionary<string, ConcurrentDictionary<int, int>>();
-
-        // 事件 Boss 白名单 ID
-        private static readonly HashSet<int> MiniBossIds = new HashSet<int>
+        // 玩家在线时长累计，用于发放在线奖励
+        private static readonly ConcurrentDictionary<string, int> SessionTime = new(); 
+        // 个人怪物击杀统计：key=玩家名，value=怪物Id -> 累计击杀数
+        private static readonly ConcurrentDictionary<string, ConcurrentDictionary<int, int>> PersonalKillTracker = new();
+        // Boss实体存活跟踪：key=Boss唯一标识，value=参与玩家数
+        private static readonly ConcurrentDictionary<int, int> BossSpawnTracker = new(); 
+        // Boss伤害追踪：key=Boss唯一标识，value=玩家名 -> 总伤害
+        private static readonly ConcurrentDictionary<int, ConcurrentDictionary<string, int>> CustomDamageTracker = new();
+        // 折扣保底机制：记录每个玩家对每个非限购商品连续未触发折扣的次数
+        private static readonly ConcurrentDictionary<string, Dictionary<int, int>> DiscountMisses = new();
+        // 当前生效的折扣标记：玩家 -> 商品id -> 是否享受折扣
+        private static readonly ConcurrentDictionary<string, Dictionary<int, bool>> ActiveDiscounts = new();
+        // 灵韵积分获取保底计数器：玩家名 -> 连续未获得灵韵积分的次数
+        private static readonly ConcurrentDictionary<string, int> CpMisses = new();
+        // Boss基础倍率映射表：BossId -> 基础奖励倍率
+        private static readonly Dictionary<int, double> BossBasePoolMultipliers = new()
         {
-            439, // 荷兰飞盗船
-            392, // 火星飞碟核心
-            315, // 南瓜王
-            325, // 哀木
-            345, // 冰霜女王
-            344, // 圣诞坦克
-            346, // 常绿尖叫怪
-            477, // 蛾怪
-            493, 507, 422, 517, // 拜月教四柱
-            564, 565 // 撒旦军队相关
+            { 50, 0.1 }, 
+            { 4, 0.15 }, 
+            { 13, 0.07 }, 
+            { 14, 0.07 }, 
+            { 15, 0.07 }, 
+            { 266, 0.2 }, 
+            { 222, 0.22 }, 
+            { 668, 0.22 }, 
+            { 35, 0.25 }, 
+            { 113, 0.3 }, 
+            { 657, 0.55 }, 
+            { 125, 0.3 }, 
+            { 126, 0.3 }, 
+            { 134, 0.65 }, 
+            { 127, 0.7 }, 
+            { 262, 0.75 }, 
+            { 245, 0.8 }, 
+            { 370, 0.85 }, 
+            { 636, 0.9 }, 
+            { 439, 0.8 }, 
+            { 398, 1.0 }, 
+            { 491, 0.1 }, 
+            { 315, 0.2 }, 
+            { 345, 0.3 }, 
+            { 392, 0.4 }, 
+            { 493, 0.5 }, 
+            { 507, 0.5 }, 
+            { 422, 0.5 }, 
+            { 517, 0.5 }
         };
+
+        /// <summary> 根据Boss netId获取基础奖励倍率，未配置则返回默认0.1 </summary>
+        private static double GetBossBaseMultiplier(int netId) => BossBasePoolMultipliers.GetValueOrDefault(netId, 0.1);
         
+        // ================= 条件初始化 =================
+        
+        /// <summary>
+        /// 根据玩家累计消费和全物品收集情况计算会员等级及折扣。
+        /// 返回值：会员名、颜色十六进制、折扣系数（1.0表示无折扣）
+        /// </summary>
+        private static (string Name, string Color, double Discount) GetMembership(PlayerAccount data)
+        {
+            lock (data.SyncLock)
+            {
+                bool hasAllItems = Epoint.Config.ShopItems.Count > 0 && 
+                                   Epoint.Config.ShopItems.All(item => data.PurchasedNormalItems.Contains(item.Id));
+
+                if (data.TotalSpent >= 60.0 * Epoint.Config.BaseDailyCap && hasAllItems) return ("至尊会员", "A32CC4", 0.60); 
+                if (data.TotalSpent >= 25.0 * Epoint.Config.BaseDailyCap) return ("高级会员", "FFD700", 0.85); 
+                if (data.TotalSpent >= 15.0 * Epoint.Config.BaseDailyCap) return ("中级会员", "C0C0C0", 0.90); 
+                if (data.TotalSpent >= 7.5 * Epoint.Config.BaseDailyCap) return ("初级会员", "CD7F32", 0.95); 
+            }
+            return ("", "", 1.0);
+        }
+
         // ================= 盲盒配置 =================
-        // 独立的掉落物类：记录物品ID、掉落概率、单次掉落数量
+        /// <summary> 盲盒掉落物品定义 </summary>
         private class BoxDrop
         {
             public int ItemId { get; init; }
-            public double Probability { get; init; } // 掉落概率 (0.0 ~ 1.0)
-            public int Stack { get; init; } = 1;     // 默认物品只给 1 个
+            public double Probability { get; init; }   // 掉落概率，总和应为 1
+            public int Stack { get; init; } = 1;     
         }
 
+        /// <summary> 盲盒商品定义 </summary>
         private class BlindBoxItem
         {
             public int Id { get; init; }
             public string Name { get; init; } = "";
-            public int IconItemId { get; init; } 
+            public int IconItemId { get; init; }
             public string ColorHex { get; init; } = "FFFFFF"; 
             public int DefaultPrice { get; init; } 
-            public List<BoxDrop> DropPool { get; init; } = new List<BoxDrop>(); // 定义掉落池
+            public List<BoxDrop> DropPool { get; init; } = new List<BoxDrop>(); 
             
-            // 通过盲盒 Name 去配置文件里匹配价格
+            /// <summary> 实际价格：优先读取配置文件中的覆盖价格，否则使用默认 </summary>
             public int Price => Epoint.Config.BlindBoxPrices.FirstOrDefault(b => b.Name == Name)?.Price ?? DefaultPrice;
         }
 
+        // 预置盲盒列表，包含ID、名称、图标、默认价格及掉落池
         private static readonly List<BlindBoxItem> BlindBoxes = new List<BlindBoxItem>
         {
-            new BlindBoxItem { Id = 101, Name = "普通盲盒", IconItemId = 306, ColorHex = "D4AF37", DefaultPrice = 1500, DropPool = new List<BoxDrop> {
-                new BoxDrop { ItemId = 437, Probability = 1.0 / 6 },
-                new BoxDrop { ItemId = 517, Probability = 1.0 / 6 },
-                new BoxDrop { ItemId = 535, Probability = 1.0 / 6 },
-                new BoxDrop { ItemId = 536, Probability = 1.0 / 6 },
-                new BoxDrop { ItemId = 532, Probability = 1.0 / 6 },
-                new BoxDrop { ItemId = 554, Probability = 1.0 / 6 }
+            new BlindBoxItem { Id = 201, Name = "普通盲盒", IconItemId = 306, ColorHex = "D4AF37", DefaultPrice = 1500, DropPool = new List<BoxDrop> {
+                new BoxDrop { ItemId = 437, Probability = 1.0 / 6 }, new BoxDrop { ItemId = 517, Probability = 1.0 / 6 },
+                new BoxDrop { ItemId = 535, Probability = 1.0 / 6 }, new BoxDrop { ItemId = 536, Probability = 1.0 / 6 },
+                new BoxDrop { ItemId = 532, Probability = 1.0 / 6 }, new BoxDrop { ItemId = 554, Probability = 1.0 / 6 }
             } },
-            new BlindBoxItem { Id = 102, Name = "冰雪盲盒", IconItemId = 681, ColorHex = "6ECFF6", DefaultPrice = 1500, DropPool = new List<BoxDrop> {
-                new BoxDrop { ItemId = 1312, Probability = 0.05 },
-                new BoxDrop { ItemId = 676, Probability = 0.95 / 3 },
-                new BoxDrop { ItemId = 1264, Probability = 0.95 / 3 },
-                new BoxDrop { ItemId = 725, Probability = 0.95 / 3 }
+            new BlindBoxItem { Id = 202, Name = "冰雪盲盒", IconItemId = 681, ColorHex = "6ECFF6", DefaultPrice = 1500, DropPool = new List<BoxDrop> {
+                new BoxDrop { ItemId = 1312, Probability = 0.05 }, new BoxDrop { ItemId = 676, Probability = 0.95 / 3 },
+                new BoxDrop { ItemId = 1264, Probability = 0.95 / 3 }, new BoxDrop { ItemId = 725, Probability = 0.95 / 3 }
             } },
-            new BlindBoxItem { Id = 103, Name = "丛林盲盒", IconItemId = 1528, ColorHex = "3A8F3A", DefaultPrice = 2500, DropPool = new List<BoxDrop> {
-                new BoxDrop { ItemId = 52, Probability = 0.1 },
-                new BoxDrop { ItemId = 1724, Probability = 0.1 },
-                new BoxDrop { ItemId = 2353, Probability = 0.1, Stack = 10 },
-                new BoxDrop { ItemId = 1922, Probability = 0.1 },
-                new BoxDrop { ItemId = 678, Probability = 0.1, Stack = 10 },
-                new BoxDrop { ItemId = 1336, Probability = 0.1 },
-                new BoxDrop { ItemId = 2676, Probability = 0.1, Stack = 5 },
-                new BoxDrop { ItemId = 2272, Probability = 0.1 },
-                new BoxDrop { ItemId = 5395, Probability = 0.1 },
-                new BoxDrop { ItemId = 4986, Probability = 0.1, Stack = 60 }
+            new BlindBoxItem { Id = 203, Name = "丛林盲盒", IconItemId = 1528, ColorHex = "3A8F3A", DefaultPrice = 2500, DropPool = new List<BoxDrop> {
+                new BoxDrop { ItemId = 52, Probability = 0.1 }, new BoxDrop { ItemId = 1724, Probability = 0.1 },
+                new BoxDrop { ItemId = 2353, Probability = 0.1, Stack = 10 }, new BoxDrop { ItemId = 1922, Probability = 0.1 },
+                new BoxDrop { ItemId = 678, Probability = 0.1, Stack = 10 }, new BoxDrop { ItemId = 1336, Probability = 0.1 },
+                new BoxDrop { ItemId = 2676, Probability = 0.1, Stack = 5 }, new BoxDrop { ItemId = 2272, Probability = 0.1 },
+                new BoxDrop { ItemId = 5395, Probability = 0.1 }, new BoxDrop { ItemId = 4986, Probability = 0.1, Stack = 60 }
             } },
-            new BlindBoxItem { Id = 104, Name = "腐化盲盒", IconItemId = 1529, ColorHex = "5A3FA0", DefaultPrice = 2500, DropPool = new List<BoxDrop> {
-                new BoxDrop { ItemId = 3014, Probability = 0.995 / 5 },
-                new BoxDrop { ItemId = 3008, Probability = 0.995 / 5 },
-                new BoxDrop { ItemId = 3012, Probability = 0.995 / 5 },
-                new BoxDrop { ItemId = 3015, Probability = 0.995 / 5 },
-                new BoxDrop { ItemId = 3023, Probability = 0.995 / 5 },
-                new BoxDrop { ItemId = 5489, Probability = 0.005 }
+            new BlindBoxItem { Id = 204, Name = "腐化盲盒", IconItemId = 1529, ColorHex = "5A3FA0", DefaultPrice = 2500, DropPool = new List<BoxDrop> {
+                new BoxDrop { ItemId = 3014, Probability = 0.995 / 5 }, new BoxDrop { ItemId = 3008, Probability = 0.995 / 5 },
+                new BoxDrop { ItemId = 3012, Probability = 0.995 / 5 }, new BoxDrop { ItemId = 3015, Probability = 0.995 / 5 },
+                new BoxDrop { ItemId = 3023, Probability = 0.995 / 5 }, new BoxDrop { ItemId = 5489, Probability = 0.005 }
             } },
-            new BlindBoxItem { Id = 105, Name = "猩红盲盒", IconItemId = 1530, ColorHex = "B03030", DefaultPrice = 2500, DropPool = new List<BoxDrop> {
-                new BoxDrop { ItemId = 3006, Probability = 0.995 / 5 },
-                new BoxDrop { ItemId = 3007, Probability = 0.995 / 5 },
-                new BoxDrop { ItemId = 3009, Probability = 0.995 / 5 },
-                new BoxDrop { ItemId = 3013, Probability = 0.995 / 5 },
-                new BoxDrop { ItemId = 3016, Probability = 0.995 / 5 },
-                new BoxDrop { ItemId = 5489, Probability = 0.005 }
+            new BlindBoxItem { Id = 205, Name = "猩红盲盒", IconItemId = 1530, ColorHex = "B03030", DefaultPrice = 2500, DropPool = new List<BoxDrop> {
+                new BoxDrop { ItemId = 3006, Probability = 0.995 / 5 }, new BoxDrop { ItemId = 3007, Probability = 0.995 / 5 },
+                new BoxDrop { ItemId = 3009, Probability = 0.995 / 5 }, new BoxDrop { ItemId = 3013, Probability = 0.995 / 5 },
+                new BoxDrop { ItemId = 3016, Probability = 0.995 / 5 }, new BoxDrop { ItemId = 5489, Probability = 0.005 }
             } },
-            new BlindBoxItem { Id = 106, Name = "神圣盲盒", IconItemId = 1531, ColorHex = "F2A6FF", DefaultPrice = 2500, DropPool = new List<BoxDrop> {
-                new BoxDrop { ItemId = 3029, Probability = 0.995 / 4 },
-                new BoxDrop { ItemId = 3030, Probability = 0.995 / 4 },
-                new BoxDrop { ItemId = 3051, Probability = 0.995 / 4 },
-                new BoxDrop { ItemId = 3022, Probability = 0.995 / 4 },
+            new BlindBoxItem { Id = 206, Name = "神圣盲盒", IconItemId = 1531, ColorHex = "F2A6FF", DefaultPrice = 2500, DropPool = new List<BoxDrop> {
+                new BoxDrop { ItemId = 3029, Probability = 0.995 / 4 }, new BoxDrop { ItemId = 3030, Probability = 0.995 / 4 },
+                new BoxDrop { ItemId = 3051, Probability = 0.995 / 4 }, new BoxDrop { ItemId = 3022, Probability = 0.995 / 4 },
                 new BoxDrop { ItemId = 5488, Probability = 0.005 }
             } },
-            new BlindBoxItem { Id = 107, Name = "奇异染料盲盒", IconItemId = 1067, ColorHex = "", DefaultPrice = 1500, DropPool = new List<BoxDrop> {
-                new BoxDrop { ItemId = 3040, Probability = 0.65 / 14 },
-                new BoxDrop { ItemId = 3028, Probability = 0.65 / 14 },
-                new BoxDrop { ItemId = 3560, Probability = 0.65 / 14 },
-                new BoxDrop { ItemId = 3041, Probability = 0.65 / 14 },
-                new BoxDrop { ItemId = 3534, Probability = 0.65 / 14 },
-                new BoxDrop { ItemId = 2872, Probability = 0.65 / 14 },
-                new BoxDrop { ItemId = 3025, Probability = 0.65 / 14 },
-                new BoxDrop { ItemId = 3190, Probability = 0.65 / 14 },
-                new BoxDrop { ItemId = 3553, Probability = 0.65 / 14 },
-                new BoxDrop { ItemId = 3027, Probability = 0.65 / 14 },
-                new BoxDrop { ItemId = 3554, Probability = 0.65 / 14 },
-                new BoxDrop { ItemId = 3555, Probability = 0.65 / 14 },
-                new BoxDrop { ItemId = 3026, Probability = 0.65 / 14 },
-                new BoxDrop { ItemId = 2871, Probability = 0.65 / 14 },
-                new BoxDrop { ItemId = 2883, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 3561, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 3598, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 3038, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 3597, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 3600, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 2873, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 2869, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 2870, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 2864, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 3556, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 2879, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 3042, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 3533, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 3039, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 2878, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 2885, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 2884, Probability = 0.3 / 18 },
-                new BoxDrop { ItemId = 3024, Probability = 0.05 }
+            new BlindBoxItem { Id = 207, Name = "奇异染料盲盒", IconItemId = 1067, ColorHex = "", DefaultPrice = 1500, DropPool = new List<BoxDrop> {
+                new BoxDrop { ItemId = 3040, Probability = 0.532 / 14 }, new BoxDrop { ItemId = 3028, Probability = 0.532 / 14 },
+                new BoxDrop { ItemId = 3560, Probability = 0.532 / 14 }, new BoxDrop { ItemId = 3041, Probability = 0.532 / 14 },
+                new BoxDrop { ItemId = 3534, Probability = 0.532 / 14 }, new BoxDrop { ItemId = 2872, Probability = 0.532 / 14 },
+                new BoxDrop { ItemId = 3025, Probability = 0.532 / 14 }, new BoxDrop { ItemId = 3190, Probability = 0.532 / 14 },
+                new BoxDrop { ItemId = 3553, Probability = 0.532 / 14 }, new BoxDrop { ItemId = 3027, Probability = 0.532 / 14 },
+                new BoxDrop { ItemId = 3554, Probability = 0.532 / 14 }, new BoxDrop { ItemId = 3555, Probability = 0.532 / 14 },
+                new BoxDrop { ItemId = 3026, Probability = 0.532 / 14 }, new BoxDrop { ItemId = 2871, Probability = 0.532 / 14 },
+                new BoxDrop { ItemId = 2883, Probability = 0.45 / 18 }, new BoxDrop { ItemId = 3561, Probability = 0.45 / 18 },
+                new BoxDrop { ItemId = 3598, Probability = 0.45 / 18 }, new BoxDrop { ItemId = 3038, Probability = 0.45 / 18 },
+                new BoxDrop { ItemId = 3597, Probability = 0.45 / 18 }, new BoxDrop { ItemId = 3600, Probability = 0.45 / 18 },
+                new BoxDrop { ItemId = 2873, Probability = 0.45 / 18 }, new BoxDrop { ItemId = 2869, Probability = 0.45 / 18 },
+                new BoxDrop { ItemId = 2870, Probability = 0.45 / 18 }, new BoxDrop { ItemId = 2864, Probability = 0.45 / 18 },
+                new BoxDrop { ItemId = 3556, Probability = 0.45 / 18 }, new BoxDrop { ItemId = 2879, Probability = 0.45 / 18 },
+                new BoxDrop { ItemId = 3042, Probability = 0.45 / 18 }, new BoxDrop { ItemId = 3533, Probability = 0.45 / 18 },
+                new BoxDrop { ItemId = 3039, Probability = 0.45 / 18 }, new BoxDrop { ItemId = 2878, Probability = 0.45 / 18 },
+                new BoxDrop { ItemId = 2885, Probability = 0.45 / 18 }, new BoxDrop { ItemId = 2884, Probability = 0.45 / 18 },
+                new BoxDrop { ItemId = 3024, Probability = 0.018 }
             } }
         };
         
-        // ================= 模块一：定时器管理 =================
+        // ================= 定时器与底层钩子管理 =================
         
-        // 初始化在线时长奖励时钟
+        /// <summary>
+        /// 初始化定时器：在线奖励定时器、自动签到/数据刷写定时器，并挂载Boss击杀钩子
+        /// 插件启用时调用
+        /// </summary>
         public static void InitializeTimer()
         {
-            _onlineTimer = new System.Timers.Timer(Epoint.Config.OnlineRewardInterval * 60 * 1000); // 转换时间单位为毫秒
-            _onlineTimer.Elapsed += OnOnlineTimerElapsed; // 绑定到点后触发的事件
-            _onlineTimer.AutoReset = true; // 允许无限循环跳动
+            _onlineTimer = new System.Timers.Timer(Epoint.Config.OnlineRewardInterval * 60 * 1000); 
+            _onlineTimer.Elapsed += OnOnlineTimerElapsed; 
+            _onlineTimer.AutoReset = true; 
             _onlineTimer.Start();
             
-            // 每 60 秒执行一次
             _autoSignInTimer = new System.Timers.Timer(60000);
             _autoSignInTimer.Elapsed += (_, _) =>
             {
-                // 自动签到与心跳查岗
                 foreach (var player in TShock.Players)
                 {
                     if (player is { Active: true, IsLoggedIn: true })
-                    {
                         TryDailySignIn(player, player.Account.Name);
-                    }
                 }
                 
-                // 定期清理因为自然消失、逃跑而遗留在内存里的幽灵 Boss 数据
-                var deadBossKeys = BossDamageTracker.Keys.Where(k => Main.npc[k] == null || !Main.npc[k].active).ToList();
-                foreach (var key in deadBossKeys)
+                // 清理已死亡的Boss追踪数据
+                var deadBossKeys = BossSpawnTracker.Keys.Where(k => Main.npc[k] == null || !Main.npc[k].active).ToList();
+                foreach (var key in deadBossKeys) 
                 {
-                    BossDamageTracker.TryRemove(key, out _);
+                    BossSpawnTracker.TryRemove(key, out _);
+                    CustomDamageTracker.TryRemove(key, out _); 
                 }
+                
+                Epoint.Data.FlushAll();
             };
             _autoSignInTimer.AutoReset = true;
             _autoSignInTimer.Start();
+
+            BossDamageTracker.OnBossKilled += NativeBossDamageTracker_OnBossKilled;
         }
 
-        // 销毁时钟（卸载插件时清理内存）
+        /// <summary> 释放定时器资源，清理所有缓存字典，解绑事件钩子 </summary>
         public static void Dispose()
         {
             _onlineTimer?.Stop();
             _onlineTimer?.Dispose();
-            // 释放心跳时钟
             _autoSignInTimer?.Stop();
             _autoSignInTimer?.Dispose();
-            // 释放所有静态集合，防止重载时内存泄漏
             SessionTime.Clear();
-            BossDamageTracker.Clear();
+            BossSpawnTracker.Clear();
             PersonalKillTracker.Clear();
+            CustomDamageTracker.Clear();
+            DiscountMisses.Clear();
+            ActiveDiscounts.Clear();
+            CpMisses.Clear();
+            
+            BossDamageTracker.OnBossKilled -= NativeBossDamageTracker_OnBossKilled;
         }
         
-        // 修改配置文件后，重启时钟让新时间生效
+        /// <summary> 热重载时更新在线奖励计时器间隔 </summary>
         public static void ReloadTimer()
         {
-            if (_onlineTimer != null)
-            {
-                _onlineTimer.Interval = Epoint.Config.OnlineRewardInterval * 60 * 1000;
-            }
+            if (_onlineTimer != null) _onlineTimer.Interval = Epoint.Config.OnlineRewardInterval * 60 * 1000;
         }
 
-        // ================= 补丁：自动签到模块 =================
-        // 通过玩家行为校验是否发放签到奖励
+        // ================= 自动签到模块 =================
+        /// <summary>
+        /// 尝试执行每日签到，使用 lock 保证并发安全。
+        /// </summary>
+        /// <param name="player">触发签到的玩家对象</param>
+        /// <param name="accountName">玩家账号名称</param>
+        /// <param name="delayMessage">是否延迟发送消息，用于登录时避免消息过早被吞</param>
         private static void TryDailySignIn(TSPlayer player, string accountName, bool delayMessage = false)
         {
             var data = Epoint.Data.GetPlayerData(accountName);
 
             string todayStr = DateTime.Now.ToString("yyyy-MM-dd");
-            if (data.LastLoginDate == todayStr) return;
-
-            int newTotalDays = data.TotalDays + 1;
-            int newStreakDays = 1;
-
-            // 连签天数计算
-            if (!string.IsNullOrEmpty(data.LastLoginDate) && DateTime.TryParse(data.LastLoginDate, out DateTime lastDate))
+            int newStreakDays, actualReward, theoreticalReward;
+            double luck;
+            
+            lock (data.SyncLock)
             {
-                if ((DateTime.Now.Date - lastDate.Date).Days == 1) newStreakDays = data.StreakDays + 1;
+                if (data.LastLoginDate == todayStr) return;
+
+                int newTotalDays = data.TotalDays + 1;
+                newStreakDays = 1;
+
+                if (!string.IsNullOrEmpty(data.LastLoginDate) && DateTime.TryParse(data.LastLoginDate, out DateTime lastDate))
+                {
+                    if ((DateTime.Now.Date - lastDate.Date).Days == 1) newStreakDays = data.StreakDays + 1;
+                }
+
+                int baseCap = Epoint.Config.FastPacedMode ? Epoint.Config.BaseDailyCap * 2 : Epoint.Config.BaseDailyCap; 
+                int dailyCap = (int)(0.9 * baseCap + 0.1 * baseCap * data.TotalDays); 
+                
+                double streakCoeff = Math.Min(1.0 + (newStreakDays * 0.01), 1.15); 
+                
+                // 正态分布随机运气值，范围钳制在[0.5,1.5]
+                double u1 = 1.0 - Rand.NextDouble();
+                double u2 = 1.0 - Rand.NextDouble();
+                double randStdNormal = Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Sin(2.0 * Math.PI * u2);
+                luck = Math.Clamp(1.0 + 0.08 * randStdNormal, 0.5, 1.5); 
+
+                theoreticalReward = (int)((0.49 * baseCap + 0.01 * baseCap * data.TotalDays) * streakCoeff * luck);
+                actualReward = Math.Min(theoreticalReward, dailyCap); 
+
+                data.Points += actualReward;
+                data.TotalEarned += actualReward; 
+                data.PointsToday = actualReward; 
+                data.TotalDays = newTotalDays;
+                data.StreakDays = newStreakDays;
+                data.LastLoginDate = todayStr;
+                data.VipLevel = GetMembership(data).Name; 
             }
-
-            // 每日签到积分奖励计算
-            int effectiveDaysForCap = Math.Max(0, data.TotalDays); // 累计登录天数
-            double daysCoeff = 1.0 + (effectiveDaysForCap * 0.1); // 累计登录系数
-            
-            int baseCap = Epoint.Config.FastPacedMode ? Epoint.Config.BaseDailyCap * 2 : Epoint.Config.BaseDailyCap; // 每日获取积分上限基数
-            int dailyCap = (int)(baseCap * daysCoeff); // 每日获取积分上限
-            int baseSignInReward = (int)(dailyCap * 0.5); // 每日签到积分基数
-            
-            double streakCoeff = Math.Min(1.0 + (newStreakDays * 0.01), 1.15); // 连签积分奖励加成，最高 1.15 倍
-            double luck = Rand.NextDouble() * 0.4 + 0.8; // 随机波动 80%~120%
-
-            int theoreticalReward = (int)(baseSignInReward * streakCoeff * luck); // 每日签到奖励积分
-            int actualReward = Math.Min(theoreticalReward, dailyCap); // 防止每日签到奖励积分超过上限
-
-            // 结算并保存到硬盘
-            data.Points += actualReward;
-            data.PointsToday = actualReward; // 玩家每日首次登录后重置当日积分获取量
-            data.TotalDays = newTotalDays;
-            data.StreakDays = newStreakDays;
-            data.LastLoginDate = todayStr;
             Epoint.Data.SavePlayerData(data);
 
-            // 使用本地函数消除内存分配开销
             void SendMessage()
             {
                 if (player.Active)
@@ -282,7 +320,7 @@ namespace EpointPlugin
                     if (luck > 1.15)
                         msg = $"[c/4CAF50:你感觉今天运气好极了！｡:.ﾟヽ(*´∀`)ﾉﾟ.:｡] 已连续签到 [c/FFD700:{newStreakDays}] [c/FFFFFF:天]，今日奖励 [c/FFD700:{actualReward}] ep";
                     else if (luck < 0.85)
-                        msg = $"[c/7B3FBF:似乎今天运气有点差 (☍~⁰。)] 已连续签到 [c/FFD700:{newStreakDays}] [c/FFFFFF:天]，今日奖励 [c/FFD700:{actualReward}] ep";
+                        msg = $"[c/7B3FBF:今天运气似乎有点差 (☍~⁰。)] 已连续签到 [c/FFD700:{newStreakDays}] [c/FFFFFF:天]，今日奖励 [c/FFD700:{actualReward}] ep";
                     else
                         msg = $"[c/FFD700:签到成功 ～(∠・ω< )⌒★] 已连续签到 [c/FFD700:{newStreakDays}] [c/FFFFFF:天]，今日奖励 [c/FFD700:{actualReward}] ep";
 
@@ -293,44 +331,35 @@ namespace EpointPlugin
                 }
             }
 
-            // 刚进服延迟2秒发消息，防止跟TShock自带的欢迎开场白糊在一起
             if (delayMessage)
             {
                 Task.Run(async () =>
                 {
                     await Task.Delay(2000);
                     if (player is { Active: true, IsLoggedIn: true } && player.Account.Name == accountName)
-                    {
                         SendMessage();
-                    }
                 });
             }
-            else
-            {
-                SendMessage();
-            }
+            else SendMessage();
         }
 
-        // ================= 模块二：插件指令处理 =================
+        // ================= 插件指令处理 =================
         
-        // 帮助菜单模块
+        /// <summary> 指令 /ephelp：显示所有积分相关指令帮助 </summary>
         public static void EpHelpCommand(CommandArgs args)
         {
             args.Player.SendInfoMessage("==================== [c/FFD700:Epoint 积分插件帮助菜单] ====================");
             args.Player.SendMessage("/epinfo [c/FFFFFF:- 查看个人积分档案与签到状态]", 85, 210, 132);
             args.Player.SendMessage("/eprank [c/FFFFFF:- 查看玩家积分排行榜]", 85, 210, 132);
-            args.Player.SendMessage("/epshop [页码][c/AAAAAA:(留空默认取1)][c/FFFFFF: - 打开积分商店 (第 1 页道具商店，第 2 页盲盒商店)]", 85, 210, 132);
+            args.Player.SendMessage("/epshop [页码][c/AAAAAA:(留空默认取1)][c/FFFFFF: - 打开积分商店]", 85, 210, 132);
             args.Player.SendMessage("/epbuy <商品序号> [购买次数][c/AAAAAA:(留空默认取1)][c/FFFFFF: - 购买商品]", 85, 210, 132);
-            args.Player.SendMessage("[c/55CDFF:积分获取途径：][c/FFD700:每日首次登录、累积在线时长、击败Boss奖励、击杀小怪里程碑奖励。]", 85, 210, 132);
+            args.Player.SendMessage("[c/55CDFF:积分获取途径：][c/FFD700:每日首次登录、在线时长、击败Boss、小怪里程碑。]", 85, 210, 132);
         }
 
-        // 计算文字的视觉宽度以便排版
-        private static int GetDisplayWidth(string str)
-        {
-            return str.Sum(c => c > 255 ? 2 : 1);
-        }
+        /// <summary> 计算字符串在控制台显示时的视觉宽度 </summary>
+        private static int GetDisplayWidth(string str) => str.Sum(c => c > 255 ? 2 : 1);
 
-        // 查询个人档案模块
+        /// <summary> 指令 /epinfo：显示玩家积分档案，包括余额、会员等级、签到记录等。并自动尝试签到。 </summary>
         public static void EpInfoCommand(CommandArgs args)
         {
             if (!args.Player.Active || !args.Player.IsLoggedIn)
@@ -340,23 +369,50 @@ namespace EpointPlugin
             }
 
             string accountName = args.Player.Account.Name;
-            TryDailySignIn(args.Player, accountName); // 查岗拦截
+            TryDailySignIn(args.Player, accountName); 
             
             var data = Epoint.Data.GetPlayerData(accountName);
 
-            // 动态计算玩家今日的积分上限
-            int effectiveDays = Math.Max(0, data.TotalDays - 1);
-            int baseCap = Epoint.Config.FastPacedMode ? Epoint.Config.BaseDailyCap * 2 : Epoint.Config.BaseDailyCap;
-            int dailyCap = (int)(baseCap * (1 + effectiveDays * 0.05));
+            int dailyCap;
+            string vipName, vipColor;
+            int points, charmPoints, pointsToday, totalDays, streakDays;
+            long totalEarned, totalSpent;
+
+            lock (data.SyncLock)
+            {
+                int baseCap = Epoint.Config.FastPacedMode ? Epoint.Config.BaseDailyCap * 2 : Epoint.Config.BaseDailyCap;
+                dailyCap = (int)(0.9 * baseCap + 0.1 * baseCap * data.TotalDays);
+                var vip = GetMembership(data);
+                vipName = vip.Name;
+                vipColor = vip.Color;
+                points = data.Points;
+                charmPoints = data.CharmPoints;
+                pointsToday = data.PointsToday;
+                totalDays = data.TotalDays;
+                streakDays = data.StreakDays;
+                totalEarned = data.TotalEarned;
+                totalSpent = data.TotalSpent;
+            }
 
             args.Player.SendInfoMessage($"======== [c/87CEEB:{accountName} 的积分档案] ========");
-            args.Player.SendSuccessMessage($"[c/FFD700:积分余额:] {data.Points} ep");
-            args.Player.SendSuccessMessage($"[c/FFA500:今日获取:] {data.PointsToday} / {dailyCap} ep");
-            args.Player.SendInfoMessage($"[c/55CDFF:累积登录:] {data.TotalDays} [c/FFFFFF:天]");
-            args.Player.SendInfoMessage($"[c/87CEEB:连续签到:] {data.StreakDays} [c/FFFFFF:天]");
+            if (!string.IsNullOrEmpty(vipName))
+                args.Player.SendMessage($"[c/FFD700:会员等级:] [c/{vipColor}:{vipName}]", 255, 255, 255);
+            args.Player.SendSuccessMessage($"[c/FFD700:积分余额:] {points} ep");
+            args.Player.SendMessage($"[c/A32CC4:灵韵积分:] {charmPoints} cp", 255, 255, 255);
+            args.Player.SendSuccessMessage($"[c/FFA500:今日获取:] {pointsToday} / {dailyCap} ep");
+            args.Player.SendInfoMessage($"[c/55CDFF:累积登录:] {totalDays} [c/FFFFFF:天]");
+            args.Player.SendInfoMessage($"[c/87CEEB:连续签到:] {streakDays} [c/FFFFFF:天]");
+            
+            args.Player.SendMessage($"[c/A9A9A9:已累计获取积分:] {totalEarned} ep", 255, 255, 255);
+            args.Player.SendMessage($"[c/A9A9A9:已累计消费积分:] {totalSpent} ep", 255, 255, 255);
         }
 
-        // 积分商店 UI 模块
+        /// <summary>
+        /// 指令 /epshop [页码]：显示商店页面
+        /// 页码1：普通道具商店（消耗ep）
+        /// 页码2：盲盒商店（消耗ep，需击败肉山解锁）
+        /// 页码3：神秘商店（消耗cp，需首次累计10cp解锁）
+        /// </summary>
         public static void EpShopCommand(CommandArgs args)
         {
             if (!args.Player.Active || !args.Player.IsLoggedIn)
@@ -365,47 +421,76 @@ namespace EpointPlugin
                 return;
             }
             
-            TryDailySignIn(args.Player, args.Player.Account.Name); // 查岗拦截
+            TryDailySignIn(args.Player, args.Player.Account.Name); 
 
-            int page = 1; // 默认第一页
-            if (args.Parameters.Count > 0)
+            int page = 1; 
+            if (args.Parameters.Count > 0 && (!int.TryParse(args.Parameters[0], out page) || page < 1 || page > 3))
             {
-                if (!int.TryParse(args.Parameters[0], out page) || page < 1 || page > 2)
-                {
-                    args.Player.SendErrorMessage("无效的页码。");
-                    return;
-                }
+                args.Player.SendErrorMessage("无效的页码。");
+                return;
             }
             
-            int currentPoints = Epoint.Data.GetPoints(args.Player.Account.Name);
+            var data = Epoint.Data.GetPlayerData(args.Player.Account.Name);
+            bool isMysticUnlocked;
+            int currentPoints, charmPoints;
+            string vipPrefix;
+            double vipMult;
 
-            if (page == 1) // ============ 第一页：道具商店 ============
+            lock (data.SyncLock)
+            {
+                isMysticUnlocked = data.IsMysticShopUnlocked;
+                currentPoints = data.Points;
+                charmPoints = data.CharmPoints;
+                var vip = GetMembership(data);
+                vipMult = vip.Discount;
+                vipPrefix = string.IsNullOrEmpty(vip.Name) ? "" : $"[c/{vip.Color}:【{vip.Name}】] ";
+            }
+
+            if (page == 3 && !isMysticUnlocked)
+            {
+                args.Player.SendErrorMessage("前面的区域，以后再来探索吧~"); 
+                return;
+            }
+
+            var myActiveDiscounts = ActiveDiscounts.GetOrAdd(args.Player.Account.Name, _ => new Dictionary<int, bool>());
+
+            if (page == 1) 
             {
                 var items = Epoint.Config.ShopItems;
-                if (items.Count == 0)
-                {
-                    args.Player.SendErrorMessage("当前暂无商品上架，请联系管理员。");
-                    return;
-                }
+                if (items.Count == 0) return;
                 
                 args.Player.SendInfoMessage("=================== [c/FFD700:Epoint 道具商店] ===================");
 
-                // 道具全部在第一页渲染
-                for (int i = 0; i < items.Count; i += 3) // 控制每行三列
+                for (int i = 0; i < items.Count; i += 3) 
                 {
                     string line = "";
-                    for (int j = 0; j < 3 && i + j < items.Count; j++) // 控制每行三列
+                    for (int j = 0; j < 3 && i + j < items.Count; j++) 
                     {
                         var item = items[i + j];
-                        // 展示泰拉瑞亚内置的物品标签，原版格式类似 [i:123] 或 [i/s10:123]（堆叠数量大于 1 时）
                         string itemTag = item.Stack > 1 ? $"[i/s{item.Stack}:{item.ItemNetId}]" : $"[i:{item.ItemNetId}]";
-                        // 限购商品序号标红，普通商品序号标黄
                         string idColor = item.IsOneTime ? "FF7E7E" : "FFFFFF";
                         
-                        // 构建显示字符串：[序号] 图标 价格 ep
-                        string rawDisplayStr = $"({item.Id}) {item.Price} ep"; // 剥除颜色代码计算原始字符串宽度
-                        int paddingSpaces = Math.Max(2, 20 - GetDisplayWidth(rawDisplayStr) - 3); // 调整商品文字间距，设置每个商品所占固定宽度（20），图标所占宽度（-3）
-                        string itemStr = $"[c/{idColor}:({item.Id})] {itemTag} [c/00FF00:{item.Price} ep]" + new string(' ', paddingSpaces); // 将空格拼在后面
+                        bool hasPity = !item.IsOneTime && myActiveDiscounts.GetValueOrDefault(item.Id, false);
+                        double finalMult = hasPity ? vipMult * 0.70 : vipMult;
+                        int finalPrice = (int)(item.Price * finalMult);
+                        
+                        string priceDisplayTag;
+                        string rawDisplayStr;
+                        
+                        if (finalPrice < item.Price)
+                        {
+                            string highlightColor = hasPity ? "FF69B4" : "FFD700"; 
+                            priceDisplayTag = $"[c/{highlightColor}:{finalPrice} ep]";
+                            rawDisplayStr = $"({item.Id}) {finalPrice} ep";
+                        }
+                        else
+                        {
+                            priceDisplayTag = $"[c/00FF00:{item.Price} ep]";
+                            rawDisplayStr = $"({item.Id}) {item.Price} ep";
+                        }
+                        
+                        int paddingSpaces = Math.Max(2, 22 - GetDisplayWidth(rawDisplayStr) - 3); 
+                        string itemStr = $"[c/{idColor}:({item.Id})] {itemTag} {priceDisplayTag}" + new string(' ', paddingSpaces);
                         line += itemStr;
                     }
                     args.Player.SendMessage(line, 255, 255, 255); 
@@ -414,34 +499,68 @@ namespace EpointPlugin
                 args.Player.SendInfoMessage("");
                 args.Player.SendInfoMessage("[c/FF7E7E:(注：红色序号为限购商品)]");
                 args.Player.SendInfoMessage("==================================================");
-                args.Player.SendMessage($"[c/FFFFFF:积分余额：]{currentPoints} ep [c/FFFFFF:|] [c/55CDFF:第 1 页] [c/FFFFFF:(输入] /epshop 2 [c/FFFFFF:查看盲盒商店)]", 85, 210, 132);
+                args.Player.SendMessage($"{vipPrefix}[c/FFFFFF:积分余额：]{currentPoints} ep [c/FFFFFF:|] [c/55CDFF:第 1 页] [c/FFFFFF:(输入] /epshop 2 [c/FFFFFF:查看盲盒商店)]", 85, 210, 132);
             }
-            
-            else // ============ 第二页：盲盒商店 ============
+            else if (page == 2)
             {
                 args.Player.SendInfoMessage("=================== [c/FFD700:Epoint 盲盒商店] ===================");
-                
-                // 进度锁提示
-                if (!Main.hardMode)
-                {
-                    args.Player.SendErrorMessage("[c/FFFFFF:【已锁定】] 本页商品需击败 [c/FF7E7E:[血肉墙]] 后方可购买！");
-                }
+                if (!Main.hardMode) args.Player.SendErrorMessage("[c/FFFFFF:【已锁定】] 本页商品需击败 [c/FF7E7E:[血肉墙]] 后方可购买！");
                 
                 foreach (var box in BlindBoxes)
                 {
-                    string drops = box.Id == 107 ? "[c/AAAAAA:内含 33 种奇异染料]" : string.Join("", box.DropPool.Select(d => d.Stack > 1 ? $"[i/s{d.Stack}:{d.ItemId}]" : $"[i:{d.ItemId}]"));
+                    string drops = box.Id == 107 ? "[c/AAAAAA:33 种奇异染料]" : string.Join("", box.DropPool.Select(d => d.Stack > 1 ? $"[i/s{d.Stack}:{d.ItemId}]" : $"[i:{d.ItemId}]"));
                     string boxName = box.Id == 107 ? BuildAnimatedGradientText(box.Name) : $"[c/{box.ColorHex}:{box.Name}]";
-                    // 格式: (序号) XX盲盒[图标] XX ep | (可能包含的物品: [图标][图标]...)
-                    string line = $"[c/FF7E7E:({box.Id})] {boxName}[i:{box.IconItemId}] [c/00FF00:{box.Price} ep] [c/FFFFFF:| (可能包含的物品: ]{drops}[c/FFFFFF:)]";
+                    
+                    int basePrice = box.Price;
+                    int finalPrice = (int)(basePrice * vipMult);
+                    string priceTag = finalPrice < basePrice ? $"[c/FFD700:{finalPrice} ep]" : $"[c/00FF00:{basePrice} ep]";
+
+                    string line = $"[c/FF7E7E:({box.Id})] {boxName}[i:{box.IconItemId}] {priceTag} [c/FFFFFF:| (可能包含的物品: ]{drops}[c/FFFFFF:)]";
                     args.Player.SendMessage(line, 255, 255, 255);
                 }
                 
                 args.Player.SendInfoMessage("==================================================");
-                args.Player.SendMessage($"[c/FFFFFF:积分余额：]{currentPoints} ep [c/FFFFFF:|] [c/55CDFF:第 1 页] [c/FFFFFF:(输入] /epshop 1 [c/FFFFFF:返回道具商店)]", 85, 210, 132);
+                string nextStr = isMysticUnlocked ? "[c/FFFFFF:(输入] /epshop 3 [c/FFFFFF:查看神秘商店)]" : "[c/FFFFFF:(输入] /epshop 1 [c/FFFFFF:返回道具商店)]";
+                args.Player.SendMessage($"{vipPrefix}[c/FFFFFF:积分余额：]{currentPoints} ep [c/FFFFFF:|] [c/55CDFF:第 2 页] {nextStr}", 85, 210, 132);
+            }
+            else
+            {
+                var items = Epoint.Config.MysticShopItems;
+                if (items.Count == 0) return;
+                
+                args.Player.SendInfoMessage("=================== [c/A32CC4:Epoint 神秘商店] ===================");
+
+                for (int i = 0; i < items.Count; i += 3) 
+                {
+                    string line = "";
+                    for (int j = 0; j < 3 && i + j < items.Count; j++) 
+                    {
+                        var item = items[i + j];
+                        string itemTag = item.Stack > 1 ? $"[i/s{item.Stack}:{item.ItemNetId}]" : $"[i:{item.ItemNetId}]";
+                        string idColor = item.IsOneTime ? "FF7E7E" : "FFFFFF";
+                        
+                        string priceDisplayTag = $"[c/A32CC4:{item.Price} cp]";
+                        string rawDisplayStr = $"({item.Id}) {item.Price} cp";
+                        
+                        int paddingSpaces = Math.Max(2, 22 - GetDisplayWidth(rawDisplayStr) - 3); 
+                        string itemStr = $"[c/{idColor}:({item.Id})] {itemTag} {priceDisplayTag}" + new string(' ', paddingSpaces);
+                        line += itemStr;
+                    }
+                    args.Player.SendMessage(line, 255, 255, 255); 
+                }
+
+                args.Player.SendInfoMessage("");
+                args.Player.SendInfoMessage("[c/FF7E7E:(注：红色序号为限购商品)]");
+                args.Player.SendInfoMessage("==================================================");
+                args.Player.SendMessage($"[c/FFFFFF:灵韵余额：][c/A32CC4:{charmPoints} cp] [c/FFFFFF:|] [c/55CDFF:第 3 页] [c/FFFFFF:(输入] /epshop 1 [c/FFFFFF:返回道具商店)]", 85, 210, 132);
             }
         }
         
-        // 核心购物结算逻辑
+        /// <summary>
+        /// 指令 /epbuy [商品序号] [购买次数]：购买商品
+        /// 支持普通道具、盲盒、神秘商店商品，处理限购、折扣保底、背包空间检查及积分扣减
+        /// 购买盲盒时广播开启结果
+        /// </summary>
         public static void EpBuyCommand(CommandArgs args)
         {
             if (!args.Player.Active || !args.Player.IsLoggedIn)
@@ -449,90 +568,172 @@ namespace EpointPlugin
                 args.Player.SendErrorMessage("[Epoint] 请先登录");
                 return;
             }
-            
             TryDailySignIn(args.Player, args.Player.Account.Name);
 
-            // 校验玩家输入的参数
             if (args.Parameters.Count < 1 || !int.TryParse(args.Parameters[0], out int shopId))
             {
                 args.Player.SendErrorMessage("语法错误。正确用法: /epbuy <商品序号> [购买次数]");
                 return;
             }
 
-            int buyTimes = 1; // 如果没输入第二参数，默认买1份
+            int buyTimes = 1; 
             if (args.Parameters.Count > 1 && (!int.TryParse(args.Parameters[1], out buyTimes) || buyTimes <= 0))
             {
-                args.Player.SendErrorMessage("无效的购买次数");
+                args.Player.SendErrorMessage("无效的购买次数。");
                 return;
             }
 
-            // 去配置文件和盲盒列表里找找有没有这个商品
             var shopItem = Epoint.Config.ShopItems.FirstOrDefault(i => i.Id == shopId);
             var blindBox = BlindBoxes.FirstOrDefault(b => b.Id == shopId);
+            var mysticItem = Epoint.Config.MysticShopItems.FirstOrDefault(i => i.Id == shopId);
 
-            if (shopItem == null && blindBox == null)
+            if (shopItem == null && blindBox == null && mysticItem == null)
             {
-                args.Player.SendErrorMessage("无效的商品序号");
-                return;
-            }
-
-            // 当前世界未击败血肉墙时拦截购买盲盒
-            if (blindBox != null && !Main.hardMode)
-            {
-                args.Player.SendErrorMessage("购买失败：盲盒系列商品需要在击败血肉墙后才能购买！");
+                args.Player.SendErrorMessage("无效的商品序号。");
                 return;
             }
             
             string accountName = args.Player.Account.Name;
-            
-            // 价格计算
-            int price = shopItem?.Price ?? blindBox?.Price ?? 0;
-            int totalCost = price * buyTimes;
-            
-            // 检验限购商品购买次数
-            if (shopItem is { IsOneTime: true })
+            var data = Epoint.Data.GetPlayerData(accountName);
+
+            // 神秘商店独立结算体系（消耗cp）
+            if (mysticItem != null)
             {
-                if (buyTimes > 1) 
+                bool isUnlocked;
+                lock (data.SyncLock) { isUnlocked = data.IsMysticShopUnlocked; }
+                
+                if (!isUnlocked)
                 {
-                    args.Player.SendErrorMessage($"【[c/B0E0E6:{shopItem.Name}]】只能购买 1 份。");
+                    args.Player.SendErrorMessage("无效的商品序号。"); 
                     return;
                 }
-                if (Epoint.Data.HasPurchasedOneTimeItem(accountName, shopItem.ItemNetId)) 
+                
+                if (mysticItem.IsOneTime)
                 {
-                    args.Player.SendErrorMessage($"购买失败：您已买过【[c/B0E0E6:{shopItem.Name}]】，限购一次。");
-                    return;
+                    if (buyTimes > 1) { args.Player.SendErrorMessage($"【[c/A32CC4:{mysticItem.Name}]】只能购买 1 份。"); return; }
+                    if (Epoint.Data.HasPurchasedOneTimeItem(accountName, mysticItem.ItemNetId)) { args.Player.SendErrorMessage($"购买失败：限购一次。"); return; }
                 }
+                
+                int requiredSlots = buyTimes; 
+                bool hasEmptySpace = args.Player.TPlayer.inventory.Take(50).Count(i => i == null || i.IsAir) >= requiredSlots;
+                if (!hasEmptySpace) { args.Player.SendErrorMessage("购买失败：背包空间不足，请先清理！"); return; }
+                
+                int totalCpCost = mysticItem.Price * buyTimes;
+                
+                lock (data.SyncLock)
+                {
+                    if (data.CharmPoints < totalCpCost)
+                    {
+                        args.Player.SendErrorMessage("购买失败：灵韵积分不足！");
+                        return;
+                    }
+                    data.CharmPoints -= totalCpCost;
+                }
+                
+                args.Player.GiveItem(mysticItem.ItemNetId, mysticItem.Stack * buyTimes);
+                if (mysticItem.IsOneTime) Epoint.Data.RecordPurchase(accountName, mysticItem.ItemNetId); 
+                
+                args.Player.SendSuccessMessage($"[c/A32CC4:成功购买 {buyTimes} 份 {mysticItem.Name}，共消费 {totalCpCost} cp！]");
+                
+                Epoint.Data.SavePlayerData(data); 
+                Task.Run(() => Epoint.Data.FlushAll()); 
+                return;
             }
 
-            // 检查玩家背包是不是满了 (取玩家前 50 格主背包空间)
-            int requiredSlots = blindBox != null ? buyTimes : 1; 
-            bool hasEmptySpace = args.Player.TPlayer.inventory.Take(50).Count(i => i == null || i.IsAir) >= requiredSlots;
-            if (!hasEmptySpace)
+            // 基础商店结算体系（ep）
+            if (blindBox != null && !Main.hardMode)
+            {
+                args.Player.SendErrorMessage("购买失败：盲盒在击败血肉墙后才能购买！");
+                return;
+            }
+
+            int reqSlots = blindBox != null ? buyTimes : 1; 
+            bool hasEmpty = args.Player.TPlayer.inventory.Take(50).Count(i => i == null || i.IsAir) >= reqSlots;
+            if (!hasEmpty)
             {
                 args.Player.SendErrorMessage("购买失败：背包空间不足，请先清理！");
                 return;
             }
+            
+            if (shopItem is { IsOneTime: true })
+            {
+                if (buyTimes > 1) { args.Player.SendErrorMessage($"【[c/B0E0E6:{shopItem.Name}]】只能购买 1 份。"); return; }
+                if (Epoint.Data.HasPurchasedOneTimeItem(accountName, shopItem.ItemNetId)) { args.Player.SendErrorMessage($"购买失败：限购一次。"); return; }
+            }
 
-            // 尝试付款
-            if (!Epoint.Data.TryRemovePoints(accountName, totalCost))
+            var myPityMisses = DiscountMisses.GetOrAdd(accountName, _ => new Dictionary<int, int>());
+            var myActiveDiscounts = ActiveDiscounts.GetOrAdd(accountName, _ => new Dictionary<int, bool>());
+
+            int totalCost = 0;
+            int successfulBuys = 0;
+            int pityTriggers = 0;
+            int basePrice = shopItem?.Price ?? blindBox?.Price ?? 0;
+
+            // 批量购买时一次性锁住玩家数据，避免多次扣款并发问题
+            lock (data.SyncLock)
+            {
+                double vipMult = GetMembership(data).Discount;
+
+                for (int k = 0; k < buyTimes; k++)
+                {
+                    bool hasPityDiscount = shopItem is { IsOneTime: false } && myActiveDiscounts.GetValueOrDefault(shopItem.Id, false);
+                    double finalMult = hasPityDiscount ? vipMult * 0.70 : vipMult;
+                    int unitPrice = (int)(basePrice * finalMult);
+
+                    if (data.Points < unitPrice) break; 
+
+                    data.Points -= unitPrice;
+                    data.TotalSpent += unitPrice;
+                    totalCost += unitPrice;
+                    successfulBuys++;
+
+                    if (shopItem is { IsOneTime: false })
+                    {
+                        if (hasPityDiscount)
+                        {
+                            myActiveDiscounts[shopItem.Id] = false;
+                            myPityMisses[shopItem.Id] = 0; 
+                        }
+                        
+                        if (!myActiveDiscounts.GetValueOrDefault(shopItem.Id, false))
+                        {
+                            int misses = myPityMisses.GetValueOrDefault(shopItem.Id, 0);
+                            double prob = misses < 4 ? 0.10 : 0.10 + (misses - 3) * 0.05;
+                            
+                            if (Rand.NextDouble() < prob)
+                            {
+                                myActiveDiscounts[shopItem.Id] = true;
+                                myPityMisses[shopItem.Id] = 0;
+                                pityTriggers++;
+                            }
+                            else myPityMisses[shopItem.Id] = misses + 1;
+                        }
+                    }
+                }
+                data.VipLevel = GetMembership(data).Name; 
+                if (shopItem != null && successfulBuys > 0) data.PurchasedNormalItems.Add(shopItem.Id);
+            }
+
+            if (successfulBuys == 0)
             {
                 args.Player.SendErrorMessage("购买失败：积分不足！(๑´ㅁ`)");
                 return;
             }
 
-            // 购买成功，发放商品
             if (shopItem != null)
             {
-                args.Player.GiveItem(shopItem.ItemNetId, shopItem.Stack * buyTimes);
-                if (shopItem.IsOneTime) Epoint.Data.RecordPurchase(accountName, shopItem.ItemNetId); // 如果是限购商品，记入限购商品记录池
-                args.Player.SendSuccessMessage("[c/00FF00:购买成功！ヽ(^ω^ )]");
+                args.Player.GiveItem(shopItem.ItemNetId, shopItem.Stack * successfulBuys);
+                if (shopItem.IsOneTime) Epoint.Data.RecordPurchase(accountName, shopItem.ItemNetId); 
+
+                args.Player.SendSuccessMessage($"[c/00FF00:购买了 {successfulBuys} 份 {shopItem.Name}，共消费 {totalCost} ep！]");
+                if (pityTriggers > 0)
+                    args.Player.SendSuccessMessage($"本次购买触发了 {pityTriggers} 次幸运 [c/FFD700:7折] 优惠！");
             }
             else if (blindBox != null)
             {
-                for (int k = 0; k < buyTimes; k++)
+                for (int k = 0; k < successfulBuys; k++)
                 {
-                    // ===== 抽卡概率算法 =====
-                    double r = Rand.NextDouble(); // 生成 0.0 ~ 1.0 的随机数
+                    double r = Rand.NextDouble(); 
                     double cumulative = 0.0;
                     BoxDrop? selectedDrop = null;
                     
@@ -545,23 +746,21 @@ namespace EpointPlugin
                             break;
                         }
                     }
-                    // 如果因为计算机浮点数精度误差没抽到，就给奖池的最后一个物品
                     selectedDrop ??= blindBox.DropPool.Last();
 
-                    // 发放物品
                     args.Player.GiveItem(selectedDrop.ItemId, selectedDrop.Stack);
-                    
-                    // 广播物品展示标签
                     string dropTag = selectedDrop.Stack > 1 ? $"[i/s{selectedDrop.Stack}:{selectedDrop.ItemId}]" : $"[i:{selectedDrop.ItemId}]";
-                    // 拦截染料盲盒，将其广播名字套上流光特效
                     string boxNameDisplay = blindBox.Id == 107 ? BuildAnimatedGradientText(blindBox.Name) : $"[c/{blindBox.ColorHex}:{blindBox.Name}]";
-                    // 全服广播开盲盒结果
                     TSPlayer.All.SendMessage($"[c/55CDFF:{accountName}] 开启了 {boxNameDisplay}，获得了 {dropTag}", 255, 255, 255);
                 }
+                args.Player.SendSuccessMessage($"[c/00FF00:开启了 {successfulBuys} 个盲盒，共消费 {totalCost} ep！]");
             }
+            
+            Epoint.Data.SavePlayerData(data); 
+            Task.Run(() => Epoint.Data.FlushAll()); 
         }
 
-        // 积分排行榜模块 (后台异步防卡顿计算)
+        /// <summary> 指令 /eprank：异步读取所有玩家数据，按积分排序显示前十名 </summary>
         public static void EpRankCommand(CommandArgs args)
         {
             Task.Run(() =>
@@ -572,26 +771,22 @@ namespace EpointPlugin
                     if (!Directory.Exists(playersDir)) return;
 
                     var files = Directory.GetFiles(playersDir, "*.json");
-                    var rankList = new List<PlayerAccount>();
+                    var rankList = new List<dynamic>(); 
 
-                    // 读取所有玩家档案
                     foreach (var file in files)
                     {
                         try
                         {
                             using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
                             using var reader = new StreamReader(stream);
-
                             string json = reader.ReadToEnd();
-                            var account = JsonConvert.DeserializeObject<PlayerAccount>(json);
+                            var account = JsonConvert.DeserializeObject<dynamic>(json);
                             if (account != null) rankList.Add(account);
                         }
-                        catch { /* 忽略损坏的文件 */ }
+                        catch (Exception ex) { TShock.Log.ConsoleError($"[Epoint] 跳过读取排行榜文件: {ex.Message}"); }
                     }
 
-                    // 取积分最高的 Top 10
-                    var topPlayers = rankList.OrderByDescending(p => p.Points).Take(10).ToList();
-
+                    var topPlayers = rankList.OrderByDescending(p => (long)p.Points).Take(10).ToList();
                     args.Player.SendMessage("======== Epoint 积分排行榜 ========", 255, 215, 0);
                     
                     if (topPlayers.Count == 0)
@@ -602,53 +797,39 @@ namespace EpointPlugin
 
                     for (int i = 0; i < topPlayers.Count; i++)
                     {
-                        string rankColor = i switch
-                        {
-                            0 => "FFD700",
-                            1 => "C0C0C0",
-                            2 => "CD7F32",
-                            _ => "FFFFFF"
-                        };
+                        string rankColor = i switch { 0 => "FFD700", 1 => "C0C0C0", 2 => "CD7F32", _ => "FFFFFF" };
                         args.Player.SendMessage($"[c/{rankColor}:Top {i + 1}.] {topPlayers[i].PlayerName} - [c/00FF00:{topPlayers[i].Points} ep]", 255, 255, 255);
                     }
                 }
                 catch (Exception ex)
                 {
-                    args.Player.SendErrorMessage($"[Epoint] 排行榜读取失败: {ex.Message}");
+                    args.Player.SendErrorMessage($"[Epoint] 排行榜生成失败: {ex.Message}");
                 }
             });
         }
         
-        // ================= 模块三：自动事件钩子监听 =================
+        // ================= 自动事件钩子监听 =================
 
-        // 玩家刚输入完登录密码触发
+        /// <summary> 玩家登录时重置在线时长计数并执行自动签到 </summary>
         public static void OnPlayerLogin(PlayerPostLoginEventArgs args)
         {
             var player = args.Player;
             if (!player.Active) return;
 
             string accountName = player.Account.Name;
-            SessionTime[accountName] = 0; // 重置该玩家的在线挂机时钟
-
-            TryDailySignIn(player, accountName, true); // true 代表延迟2秒发消息
+            SessionTime[accountName] = 0; 
+            TryDailySignIn(player, accountName, true); 
         }
         
-        // 累计在线时长定时器逻辑
+        /// <summary>
+        /// 在线奖励定时器回调：为每个在线玩家发放周期奖励（基础10ep，有暴击概率），同时尝试发放灵韵积分（cp）
+        /// 设有每日积分上限，使用 lock 保证数据安全
+        /// </summary>
         private static void OnOnlineTimerElapsed(object? sender, ElapsedEventArgs e)
         {
-            // 获取当前真实存活的玩家账号哈希表，用于校验
-            var activeAccounts = TShock.Players
-                .Where(p => p is { Active: true, IsLoggedIn: true })
-                .Select(p => p.Account.Name)
-                .ToHashSet();
+            var activeAccounts = TShock.Players.Where(p => p is { Active: true, IsLoggedIn: true }).Select(p => p.Account.Name).ToHashSet();
+            foreach (var account in SessionTime.Keys) if (!activeAccounts.Contains(account)) SessionTime.TryRemove(account, out _);
 
-            // 清理非正常掉线的幽灵数据
-            foreach (var account in SessionTime.Keys)
-            {
-                if (!activeAccounts.Contains(account)) SessionTime.TryRemove(account, out _);
-            }
-
-            // 遍历服务器里的所有玩家
             foreach (var player in TShock.Players)
             {
                 if (player == null || !player.Active || !player.IsLoggedIn) continue;
@@ -656,179 +837,208 @@ namespace EpointPlugin
                 string accountName = player.Account.Name;
                 TryDailySignIn(player, accountName);
                 
-                // 修改并发安全，原子化累加在线时长
                 SessionTime.AddOrUpdate(accountName, Epoint.Config.OnlineRewardInterval, (_, v) => v + Epoint.Config.OnlineRewardInterval);
 
                 var data = Epoint.Data.GetPlayerData(accountName);
-                int effectiveDays = Math.Max(0, data.TotalDays - 1);
-                double daysCoeff = 1.0 + (effectiveDays * 0.05);
-
-                // ================= 在线奖励暴击算法 =================
+                
+                int dailyCap;
+                int actualReward = 0;
                 double randLucky = Rand.NextDouble();
                 int baseOnlineReward;
                 string msgPrefix;
 
-                if (randLucky < 0.04) // 4% 概率：超级暴击
-                {
-                    baseOnlineReward = 50;
-                    msgPrefix = "[c/87CEEB:在线奖励超级暴击！！]";
-                }
-                else if (randLucky < 0.14) // 10% 概率：普通暴击
-                {
-                    baseOnlineReward = 30;
-                    msgPrefix = "[c/87CEEB:在线奖励暴击！]";
-                }
-                else // 86% 概率：正常奖励
-                {
-                    baseOnlineReward = 10;
-                    msgPrefix = "[c/87CEEB:在线奖励]";
-                }
+                if (randLucky < 0.04) { baseOnlineReward = 50; msgPrefix = "[c/87CEEB:在线奖励超级暴击！！]"; }
+                else if (randLucky < 0.14) { baseOnlineReward = 30; msgPrefix = "[c/87CEEB:在线奖励暴击！]"; }
+                else { baseOnlineReward = 10; msgPrefix = "[c/87CEEB:在线奖励]"; }
 
-                // 快节奏模式双倍加成
                 int theoreticalReward = Epoint.Config.FastPacedMode ? baseOnlineReward * 2 : baseOnlineReward;
 
-                // ================= 积分拦截与发放 =================
-                int baseCap = Epoint.Config.FastPacedMode ? Epoint.Config.BaseDailyCap * 2 : Epoint.Config.BaseDailyCap;
-                int dailyCap = (int)(baseCap * daysCoeff);
-                int remainingCap = dailyCap - data.PointsToday;
+                lock (data.SyncLock)
+                {
+                    int baseCap = Epoint.Config.FastPacedMode ? Epoint.Config.BaseDailyCap * 2 : Epoint.Config.BaseDailyCap;
+                    dailyCap = (int)(0.9 * baseCap + 0.1 * baseCap * data.TotalDays);
+                    int remainingCap = dailyCap - data.PointsToday;
+                    
+                    int cpMisses = CpMisses.GetValueOrDefault(accountName, 0);
+                    double cpProb = cpMisses == 5 ? 0.40 : 0.02; 
+                    
+                    if (Rand.NextDouble() < cpProb)
+                    {
+                        CpMisses[accountName] = 0;
+                        data.CharmPoints += 1;
+                        
+                        player.SendMessage($"[c/A32CC4:这是什么？灵韵积分！获得了] [c/00FF00:1] [c/A32CC4:cp]", 255, 255, 255);
+                        
+                        if (!data.IsMysticShopUnlocked && data.CharmPoints >= 10)
+                        {
+                            data.IsMysticShopUnlocked = true; 
+                            player.SendMessage($"[c/A32CC4:Epoint 【神秘商店】已永久开启！快去] [c/00FF00:/epshop 3] [c/A32CC4:看看吧~]", 255, 255, 255);
+                        }
+                    }
+                    else
+                    {
+                        cpMisses++;
+                        if (cpMisses >= 6) cpMisses = 0; 
+                        CpMisses[accountName] = cpMisses;
+                    }
+
+                    if (remainingCap > 0) 
+                    {
+                        actualReward = Math.Min(theoreticalReward, remainingCap);
+                        data.Points += actualReward;
+                        data.TotalEarned += actualReward; 
+                        data.PointsToday += actualReward;
+                        data.VipLevel = GetMembership(data).Name;
+                    }
+                }
                 
-                if (remainingCap <= 0) continue; 
-                
-                int actualReward = Math.Min(theoreticalReward, remainingCap);
+                Epoint.Data.SavePlayerData(data); 
 
                 if (actualReward > 0)
                 {
-                    Epoint.Data.AddPoints(accountName, actualReward);
-                    
-                    data.PointsToday += actualReward;
-                    Epoint.Data.SavePlayerData(data); 
-                    
-                    string capSuffix = (data.PointsToday >= dailyCap) ? " [c/FF0000:(今日积分已达上限！)]" : "";
-                    
+                    string capSuffix = (data.PointsToday >= dailyCap) ? " [c/FF0000:(今日获取积分已达上限！)]" : "";
                     player.SendSuccessMessage($"[c/55CDFF:叮咚～(∠・ω< )⌒★] {msgPrefix} [c/FFD700:{actualReward}] ep{capSuffix}");
                 }
             }
         }
 
-        // 玩家退出服务器时触发
+        /// <summary> 玩家离开时清理其相关缓存数据并触发数据刷写 </summary>
         public static void OnPlayerLeave(LeaveEventArgs args)
         {
             var player = TShock.Players[args.Who];
             if (player is { Active: true, IsLoggedIn: true })
             {
-                // 清理该玩家占用的内存数据字典
                 SessionTime.TryRemove(player.Account.Name, out _);
                 PersonalKillTracker.TryRemove(player.Account.Name, out _);
+                DiscountMisses.TryRemove(player.Account.Name, out _);
+                ActiveDiscounts.TryRemove(player.Account.Name, out _);
+                CpMisses.TryRemove(player.Account.Name, out _);
+                
+                Epoint.Data.FlushAndRemove(player.Account.Name);
             }
         }
         
-        // 服务器里如果有 NPC 被打则会触发这个钩子
+        /// <summary>
+        /// NPC受击钩子：记录玩家对Boss或类Boss（如世吞）的伤害，用于最终奖励分配
+        /// 对于普通Boss使用原版的NPCDamageTracker统计，对于类Boss使用自定义追踪
+        /// </summary>
         public static void OnNpcStrike(object? sender, GetDataHandlers.NPCStrikeEventArgs args)
         {
             var player = args.Player;
             var npc = Main.npc[args.ID];
 
-            if (!player.Active || !player.IsLoggedIn) return;
-            if (!npc.active) return;
+            if (!player.Active || !player.IsLoggedIn || !npc.active) return;
             
-            bool isEow = npc.netID is 13 or 14 or 15; // 识别世界吞噬怪的体节 (13=头, 14=身, 15=尾)
-            if (!npc.boss && !MiniBossIds.Contains(npc.netID) && !isEow) return; // 忽略既不是原版 Boss 也不在特殊小头目白名单里的敌怪
+            bool isEow = npc.netID is 13 or 14 or 15;
             
-            string accountName = player.Account.Name;
-            
-            // 在记录伤害时，多部件 Boss 统一映射到其核心本体 ID 上
-            int bossKey;
-            if (isEow) 
+            // 处理类Boss（非标准Boss也使用Boss倍率表的实体）
+            if (!npc.boss && (BossBasePoolMultipliers.ContainsKey(npc.netID) || isEow))
             {
-                bossKey = -13; // 世吞单独处理：将所有世吞体节虚拟统合在 ID-13 上
-            }
-            else 
-            {
-                bossKey = npc.realLife >= 0 ? npc.realLife : npc.whoAmI;
+                int bossKey = isEow ? -13 : (npc.realLife >= 0 ? npc.realLife : npc.whoAmI);
+                BossSpawnTracker.GetOrAdd(bossKey, _ => TShock.Players.Count(p => p is { Active: true }));
+                
+                var dict = CustomDamageTracker.GetOrAdd(bossKey, _ => new ConcurrentDictionary<string, int>());
+                dict.AddOrUpdate(player.Account.Name, args.Damage, (_, v) => v + args.Damage);
+                return;
             }
             
-            // 确保内部字典存在，并原子化累加伤害
-            var bossDict = BossDamageTracker.GetOrAdd(bossKey, _ => new ConcurrentDictionary<string, int>());
-            bossDict.AddOrUpdate(accountName, args.Damage, (_, v) => v + args.Damage);
+            if (npc.boss)
+            {
+                int bossKey = npc.realLife >= 0 ? npc.realLife : npc.whoAmI;
+                BossSpawnTracker.GetOrAdd(bossKey, _ => TShock.Players.Count(p => p is { Active: true }));
+            }
         }
 
-        // 服务器里如果有怪物被击杀则会触发这个钩子
+        /// <summary>
+        /// 原版Boss击杀钩子（通过 On.Terraria.GameContent.BossDamageTracker 触发）
+        /// 从原版伤害统计中读取玩家伤害占比，并调用 GrantBossReward 发放奖励
+        /// </summary>
+        private static void NativeBossDamageTracker_OnBossKilled(BossDamageTracker.orig_OnBossKilled orig, Terraria.GameContent.BossDamageTracker self, NPC npc)
+        {
+            orig(self, npc); 
+            
+            int netId = npc.netID;
+            int bossKey = npc.realLife >= 0 ? npc.realLife : npc.whoAmI;
+            
+            int pCount = BossSpawnTracker.TryRemove(bossKey, out int count) ? count : TShock.Players.Count(p => p is { Active: true });
+            
+            double baseMult = GetBossBaseMultiplier(netId);
+            double mpMult = pCount == 1 ? 1.0 : (pCount == 2 ? 1.6 : (pCount == 3 ? 2.1 : (pCount == 4 ? 2.4 : 2.5)));
+            string bossName = npc.FullName;
+
+            int[] damagePercentages = Terraria.GameContent.NPCDamageTracker.CalculatePercentages(self._list.Select(x => x.Damage).ToArray());
+
+            for (int i = 0; i < self._list.Count; i++)
+            {
+                var entry = self._list[i];
+                if (entry is Terraria.GameContent.NPCDamageTracker.PlayerCreditEntry playerEntry)
+                {
+                    int percentage = damagePercentages[i];
+                    if (percentage > 0)
+                    {
+                        var tsPlayer = TShock.Players.FirstOrDefault(p => p is { Active: true, IsLoggedIn: true } && p.Name == playerEntry.PlayerName);
+                        if (tsPlayer != null)
+                            GrantBossReward(tsPlayer, tsPlayer.Account.Name, baseMult, mpMult, percentage / 100.0, bossName);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// NPC死亡事件钩子
+        /// 处理类Boss的击杀奖励分配（基于自定义伤害追踪）
+        /// 处理普通小怪的50击杀里程碑奖励。
+        /// </summary>
         public static void OnNpcKilled(NpcKilledEventArgs args)
         {
             var npc = args.npc;
             int netId = npc.netID;
             bool isEow = netId is 13 or 14 or 15;
 
-            // ---- 情况A：击杀 Boss 或 特殊小头目 ----
-            if (npc.boss || MiniBossIds.Contains(netId) || isEow)
+            // 处理类Boss击杀（世吞或配置表里的非标准Boss）
+            if (!npc.boss && (BossBasePoolMultipliers.ContainsKey(netId) || isEow))
             {
-                // 在 Boss 结算的最开始遍历一次当前所有合法的在线玩家存入缓存列表
-                var activePlayers = TShock.Players.Where(p => p is { Active: true, IsLoggedIn: true, Account: not null }).ToList();
+                int bossKey = isEow ? -13 : (npc.realLife >= 0 ? npc.realLife : npc.whoAmI);
                 
-                int bossKey;
-                int baseBossPool;
-                string bossName;
-
                 if (isEow)
                 {
-                    // 世吞单独处理：检查全图是否还有其他存活的世吞体节，条件 n.whoAmI != npc.whoAmI 排除掉当前正在死亡的这块体节
                     bool eowAlive = Main.npc.Any(n => n is { active: true, netID: 13 or 14 or 15 } && n.whoAmI != npc.whoAmI);
                     if (eowAlive) return;
+                }
 
-                    bossKey = -13;
-                    bossName = "世界吞噬怪";
-                    
-                    // 单独计算世吞血量上限
-                    int playerCount = activePlayers.Count;
-                    double dynamicLifeMax = 10000 * (1.0 + Math.Max(0, playerCount - 1) * 0.35);
-                    
-                    baseBossPool = (int)(400 * (1 - Math.Exp(-dynamicLifeMax / 15000.0))); // Boss 非线性平滑奖励函数
-                }
-                else
+                if (CustomDamageTracker.TryRemove(bossKey, out var dmgDict))
                 {
-                    bossKey = npc.realLife >= 0 ? npc.realLife : npc.whoAmI;
-                    bossName = npc.FullName;
-                    baseBossPool = (int)(400 * (1 - Math.Exp(-npc.lifeMax / 15000.0))); // Boss 非线性平滑奖励函数
-                }
-                
-                baseBossPool = Math.Clamp(baseBossPool, 100, 400); // 调整 Boss 奖励上下限
-                
-                if (Epoint.Config.BossRewardByDamage)
-                {
-                    // 模式1：根据造成的伤害比例分配积分
-                    if (BossDamageTracker.TryGetValue(bossKey, out var dmgDict) && dmgDict.Count > 0)
+                    int pCount = BossSpawnTracker.TryRemove(bossKey, out int count) ? count : TShock.Players.Count(p => p is { Active: true });
+                    double baseMult = GetBossBaseMultiplier(isEow ? -13 : netId);
+                    double mpMult = pCount == 1 ? 1.0 : (pCount == 2 ? 1.6 : (pCount == 3 ? 2.1 : (pCount == 4 ? 2.4 : 2.5)));
+                    string bossName = isEow ? "世界吞噬怪" : npc.FullName;
+                    
+                    int maxHp = isEow ? (int)(10000 * (1.0 + Math.Max(0, pCount - 1) * 0.35)) : npc.lifeMax;
+                    // int totalPlayerDamage = dmgDict.Values.Sum();
+                    // int trapDamage = Math.Max(0, maxHp - totalPlayerDamage); (已弃用的陷阱和环境伤害统计)
+                    
+                    var activePlayers = TShock.Players.Where(p => p is { Active: true, IsLoggedIn: true, Account: not null }).ToList();
+                    
+                    foreach (var kvp in dmgDict)
                     {
-                        int totalDamage = dmgDict.Values.Sum();
-                        foreach (var kvp in dmgDict)
+                        double damagePercent = Math.Floor((double)kvp.Value / maxHp * 100) / 100.0;
+                        if (damagePercent > 0)
                         {
-                            string accountName = kvp.Key;
-                            double damagePercent = (double)kvp.Value / totalDamage;
-                            
-                            var p = activePlayers.FirstOrDefault(pl => pl.Account.Name == accountName);
-                            if (p != null) GrantBossReward(p, accountName, baseBossPool, damagePercent, bossName);
+                            var tsPlayer = activePlayers.FirstOrDefault(pl => pl.Account.Name == kvp.Key);
+                            if (tsPlayer != null) GrantBossReward(tsPlayer, kvp.Key, baseMult, mpMult, damagePercent, bossName);
                         }
                     }
                 }
-                else
-                {
-                    // 模式2：只要在线的登录玩家，全部平分奖励积分池
-                    if (activePlayers.Count > 0)
-                    {
-                        double equalPercent = 1.0 / activePlayers.Count;
-                        foreach (var p in activePlayers) GrantBossReward(p, p.Account.Name, baseBossPool, equalPercent, bossName);
-                    }
-                }
-                
-                BossDamageTracker.TryRemove(bossKey, out _); // 积分分配完成，把这只 Boss 的伤害数据从内存删掉
                 return;
             }
 
-            // ---- 情况B：击杀小怪(记录里程碑) ----
-            // 如果是友好 NPC、低于 5 血的怪、雕像生成的怪，则无视
+            if (npc.boss) return;
+
+            // 过滤掉友好NPC、低生命值NPC、雕像生成的NPC
             if (npc.friendly || npc.lifeMax < 5 || npc.SpawnedFromStatue) return;
             
-            int killerIndex = npc.lastInteraction; // 找出是谁补的最后一刀
-            if (killerIndex < 0 || killerIndex >= 255) return; // 如果是陷阱杀死的则无视
+            int killerIndex = npc.lastInteraction; 
+            if (killerIndex < 0 || killerIndex >= 255) return; 
 
             var killerPlayer = TShock.Players[killerIndex];
             if (killerPlayer == null || !killerPlayer.Active || !killerPlayer.IsLoggedIn) return;
@@ -836,84 +1046,100 @@ namespace EpointPlugin
             string killerAccount = killerPlayer.Account.Name;
             TryDailySignIn(killerPlayer, killerAccount);
 
-            // 在玩家的个人字典里原子化累加击杀数
             var killDict = PersonalKillTracker.GetOrAdd(killerAccount, _ => new ConcurrentDictionary<int, int>());
             int personalKills = killDict.AddOrUpdate(netId, 1, (_, v) => v + 1);
             
-            // 如果累计击杀了 50 只 (或是 100, 150...)
+            // 每击杀50只同种怪物触发一次里程碑奖励
             if (personalKills > 0 && personalKills % 50 == 0)
             {
                 var data = Epoint.Data.GetPlayerData(killerAccount);
-                // 获取这种怪在原版普通模式下的初始血量
+
                 int baseLifeMax = Terraria.ID.ContentSamples.NpcsByNetId[netId].lifeMax;
-                // 小怪非线性平滑奖励函数
                 int baseMobReward = (int)(200 * (1 - Math.Exp(-baseLifeMax / 250.0)));
                 baseMobReward = Math.Clamp(baseMobReward, 50, 150);
                 
-                int effectiveDays = Math.Max(0, data.TotalDays - 1);
-                double daysCoeff = 1.0 + (effectiveDays * 0.05);
+                int actualReward = 0;
+                int dailyCap;
                 
-                int theoreticalReward = baseMobReward;
-                if (Epoint.Config.FastPacedMode) theoreticalReward *= 2;
+                lock (data.SyncLock)
+                {
+                    int baseCap = Epoint.Config.FastPacedMode ? Epoint.Config.BaseDailyCap * 2 : Epoint.Config.BaseDailyCap;
+                    dailyCap = (int)(0.9 * baseCap + 0.1 * baseCap * data.TotalDays);
+                    
+                    int theoreticalReward = Epoint.Config.FastPacedMode ? baseMobReward * 2 : baseMobReward;
+                    int remainingCap = dailyCap - data.PointsToday;
+                    
+                    if (remainingCap > 0)
+                    {
+                        actualReward = Math.Min(theoreticalReward, remainingCap);
+                        data.Points += actualReward;
+                        data.TotalEarned += actualReward; 
+                        data.PointsToday += actualReward;
+                        data.VipLevel = GetMembership(data).Name;
+                    }
+                }
 
-                int baseCap = Epoint.Config.FastPacedMode ? Epoint.Config.BaseDailyCap * 2 : Epoint.Config.BaseDailyCap;
-                int dailyCap = (int)(baseCap * daysCoeff);
-                int remainingCap = dailyCap - data.PointsToday;
-                
-                if (remainingCap <= 0) return;
-
-                int actualReward = Math.Min(theoreticalReward, remainingCap);
+                if (actualReward <= 0) return;
 
                 Task.Run(async () =>
                 {
                     await Task.Delay(2000);
-                    if (killerPlayer is { Active: true, IsLoggedIn: true } && killerPlayer.Account.Name == killerAccount && actualReward > 0)
+                    if (killerPlayer is { Active: true, IsLoggedIn: true } && killerPlayer.Account.Name == killerAccount)
                     {
-                        Epoint.Data.AddPoints(killerAccount, actualReward);
-                        
-                        data.PointsToday += actualReward;
                         Epoint.Data.SavePlayerData(data);
-                        
-                        string capSuffix = (data.PointsToday >= dailyCap) ? " [c/FF0000:(今日积分已达上限！)]" : "";
-                        
+                        string capSuffix = (data.PointsToday >= dailyCap) ? " [c/FF0000:(今日获取积分已达上限！)]" : "";
                         killerPlayer.SendSuccessMessage($"[c/FFD700:达成里程碑！(ง๑ •̀_•́)ง] 击败了 {personalKills} 只 [c/B0E0E6:{npc.FullName}]，奖励 {actualReward} ep{capSuffix}");
                     }
                 });
             }
         }
         
-        // 提取出来的公共发奖方法：用来给打赢 Boss 的玩家算分
-        private static void GrantBossReward(TSPlayer player, string accountName, int baseBossPool, double percent, string bossName)
+        /// <summary>
+        /// 发放Boss击杀奖励的核心逻辑
+        /// 根据玩家伤害占比、Boss基础倍率、多人倍率、玩家等级上限等计算实际奖励积分
+        /// 注意：存在复杂上限裁剪逻辑，可能需重构 
+        /// </summary>
+        private static void GrantBossReward(TSPlayer player, string accountName, double baseMult, double mpMult, double percent, string bossName)
         {
             TryDailySignIn(player, accountName);
             
             var data = Epoint.Data.GetPlayerData(accountName);
             
-            int effectiveDays = Math.Max(0, data.TotalDays - 1);
-            double daysCoeff = 1.0 + (effectiveDays * 0.05);
+            int actualReward = 0;
+            int dailyCap;
 
-            // 公式：Boss总奖池 * 该玩家输出占比 * 天数加成
-            int theoreticalReward = (int)(baseBossPool * percent);
-            if (Epoint.Config.FastPacedMode) theoreticalReward *= 2;
+            lock (data.SyncLock)
+            {
+                int baseCap = Epoint.Config.FastPacedMode ? Epoint.Config.BaseDailyCap * 2 : Epoint.Config.BaseDailyCap;
+                dailyCap = (int)(0.9 * baseCap + 0.1 * baseCap * data.TotalDays);
 
-            int baseCap = Epoint.Config.FastPacedMode ? Epoint.Config.BaseDailyCap * 2 : Epoint.Config.BaseDailyCap;
-            int dailyCap = (int)(baseCap * daysCoeff);
-            
-            int remainingCap = dailyCap - data.PointsToday;
-            if (remainingCap <= 0) return;
-            
-            int actualReward = Math.Min(theoreticalReward, remainingCap);
+                double playerCap = 0.2 * baseCap + 0.04 * baseCap * data.TotalDays;
+                double effectiveBaseMult = baseMult;
+                
+                // TODO: 该条件逻辑意图限制单次Boss奖励不超过玩家个人上限，但实现较晦涩，建议重构
+                if (playerCap <= baseCap)
+                {
+                    if (baseMult * baseCap > playerCap) effectiveBaseMult = playerCap / baseCap; 
+                }
+
+                int theoreticalReward = (int)(effectiveBaseMult * baseCap * mpMult * percent);
+                int remainingCap = dailyCap - data.PointsToday;
+                
+                if (remainingCap > 0)
+                {
+                    actualReward = Math.Min(theoreticalReward, remainingCap);
+                    data.Points += actualReward;
+                    data.TotalEarned += actualReward; 
+                    data.PointsToday += actualReward;
+                    data.VipLevel = GetMembership(data).Name;
+                }
+            }
 
             if (actualReward > 0)
             {
-                Epoint.Data.AddPoints(accountName, actualReward);
-                
-                data.PointsToday += actualReward;
                 Epoint.Data.SavePlayerData(data);
-                
-                string capSuffix = (data.PointsToday >= dailyCap) ? " [c/FF0000:(今日积分已达上限！)]" : "";
-                
-                player.SendSuccessMessage($"[c/FFD700:恭喜(੭ु´ ᐜ `)੭ु⁾⁾] [c/B0E0E6:{bossName}] 已被击败！根据您的表现，奖励 [c/FFD700:{actualReward}] ep{capSuffix}");
+                string capSuffix = (data.PointsToday >= dailyCap) ? " [c/FF0000:(今日获取积分已达上限！)]" : "";
+                player.SendSuccessMessage($"[c/FFD700:恭喜(੭ु´ ᐜ `)੭ु⁾⁾] 成功击败[c/B0E0E6:{bossName}]，奖励 [c/FFD700:{actualReward}] ep{capSuffix}");
             }
         }
     }
